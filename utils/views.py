@@ -1,16 +1,4 @@
-import typing
-
 import discord
-
-
-class DynamicButtonDict(typing.TypedDict, total=False):
-    label: str
-    style: discord.ButtonStyle
-    id: str
-    emoji: str | discord.PartialEmoji
-    disabled: bool
-    callback: typing.Callable | str
-    link: str
 
 
 class DynamicButtonView(discord.ui.View):
@@ -18,7 +6,7 @@ class DynamicButtonView(discord.ui.View):
     Dynamic button view: this is PAIN
     """
 
-    def __init__(self, buttons: list[DynamicButtonDict]) -> None:
+    def __init__(self, buttons: list[dict]) -> None:
         """
         Create a dynamic button view
         :param buttons: list of buttons as dictionaries

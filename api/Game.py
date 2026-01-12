@@ -1,24 +1,52 @@
+from enum import Enum
+
 from api.Command import Command
 from api.MessageComponents import MessageComponent
 from api.Player import Player
 
 
+class PlayerOrder(Enum):
+    """Enum for specifying player order behavior."""
+    RANDOM = "random"  # Randomize player order (default)
+    PRESERVE = "preserve"  # Keep the order players joined
+    CREATOR_FIRST = "creator_first"  # Creator always goes first, rest randomized
+    REVERSE = "reverse"  # Reverse the join order
+
+
 class Game:
     """
     A generic, featureless Game object.
+
+    Games should inherit from this class and implement the required methods.
+
+    Class Attributes:
+        begin_command_description (str): Description shown in /play command
+        move_command_group_description (str): Description for move commands group
+        description (str): Full description of the game
+        name (str): Human-readable name of the game
+        players (int | list[int]): Number of players allowed
+        moves (list[Command]): List of move commands
+        author (str): Game author
+        version (str): Game version
+        author_link (str): Link to author's page
+        source_link (str): Link to source code
+        time (str): Estimated game duration
+        difficulty (str): Game difficulty level
+        player_order (PlayerOrder): How to order players (default: RANDOM)
     """
     begin_command_description: str
     move_command_group_description: str
     description: str
     name: str
     players: int | list[int]
-    moves = list[Command]
+    moves: list[Command] = []
     author: str
     version: str
     author_link: str
     source_link: str
     time: str
     difficulty: str
+    player_order: PlayerOrder = PlayerOrder.RANDOM
 
     def __init__(self, players: list[Player]) -> None:
         """

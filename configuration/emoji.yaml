@@ -1,0 +1,25 @@
+emojis:
+  loading:
+    id: 1308083174420774963
+    animated: true
+  user:
+    id: 1328138963512201256
+    animated: false
+  pointing:
+    id: 1328138400808828969
+    animated: false
+  facepalm:
+    id: 1328480069156606144
+    animated: true
+  github:
+    id: 1329546977377259692
+    animated: false
+  clueless:
+    id: 1329547266087718975
+    animated: false
+  explosion:
+    id: 1328480397121683549
+    animated: true
+  hmm:
+    id: 1328480770846621757
+    animated: false

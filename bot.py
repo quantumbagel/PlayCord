@@ -3,23 +3,23 @@ import importlib
 import logging
 import random
 import sys
-import time
 import traceback
 import typing
 from typing import Any
 
 from discord import AppCommandOptionType, app_commands
-from discord.app_commands import Choice, Group
+from discord.app_commands import CheckFailure, Choice, Group
 from discord.app_commands.transformers import RangeTransformer
 from ruamel.yaml import YAML
 
 import configuration.constants as constants
 from api.Command import Command
 from configuration.constants import *
-from utils import database
+from utils import database as db, ramcheck  # So we can call database.startup() from this context
 from utils.analytics import Timer
 from utils.conversion import contextify
 from utils.embeds import CustomEmbed, ErrorEmbed
+from utils.emojis import get_emoji_string
 from utils.formatter import Formatter
 from utils.interfaces import GameInterface, MatchmakingInterface
 from utils.views import InviteView
@@ -43,7 +43,7 @@ log = logging.getLogger(LOGGING_ROOT)  # Base logger
 startup_logger = log.getChild("startup")
 
 startup_logger.info(f"Welcome to {NAME} by @quantumbagel!")
-startup_initial_time = time.time()
+startup_initial_time = Timer().start()
 
 if __name__ != "__main__":
     startup_logger.critical(ERROR_IMPORTED)
@@ -55,14 +55,14 @@ def load_configuration() -> dict | None:
     Load configuration from constants.CONFIG_FILE
     :return: the configuration as a dictionary
     """
-    begin_load_config = time.time()
+    begin_load_config = Timer().start()
     try:
         loaded_config_file = YAML().load(open(CONFIG_FILE))
     except FileNotFoundError:
         startup_logger.critical("Configuration file not found.")
         return
     startup_logger.debug(
-        f"Successfully loaded configuration file in {round((time.time() - begin_load_config) * 100, 4)}ms!")
+        f"Successfully loaded configuration file in {begin_load_config.current_time}ms!")
     return loaded_config_file
 
 
@@ -71,20 +71,21 @@ if config is None:
     sys.exit(1)
 constants.CONFIGURATION = config  # Set global configuration
 
-database_startup_time = time.time()
-database_startup = database.startup()  # Start up the database
+database_startup_time = Timer().start()
+database_startup = db.startup()  # Start up the database
+
 if not database_startup:  # Database better work lol
     startup_logger.critical("Database failed to connect on startup!")
     sys.exit(1)
 else:
-    startup_logger.info(f"Database startup completed in {round((time.time() - database_startup_time) * 100, 4)}ms.")
+    startup_logger.info(f"Database startup completed in {database_startup_time.current_time}ms.")
 
 client = discord.Client(intents=discord.Intents.all())  # Create the client with all intents, so we can read messages
 tree = app_commands.CommandTree(client)  # Build command tree
 
 # Root command registration
-command_root = app_commands.Group(name=LOGGING_ROOT, description="PlayCord command group. ChangeME", guild_only=True)
-play = app_commands.Group(name="play", description="Play all da games here", guild_only=True)
+command_root = app_commands.Group(name=LOGGING_ROOT, description="Everything that isn't a game.", guild_only=False)
+play = app_commands.Group(name="play", description="All of the games of PlayCord.", guild_only=True)
 
 
 async def send_simple_embed(ctx: discord.Interaction, title: str, description: str, ephemeral: bool = True,
@@ -115,17 +116,17 @@ async def interaction_check(ctx: discord.Interaction) -> bool:
     :param ctx: the Interaction to checker
     :return: true or false
     """
-    logger = log.getChild("is_allowed")
+    f_log = log.getChild("is_allowed")
 
     if not IS_ACTIVE:  # Bot disabled via message command
         await send_simple_embed(ctx, "Bot has been disabled!", f"{NAME} "
                                                                f"has been temporarily disabled by a bot owner. This"
                                                                " is likely due to a critical bug or exploit being discovered.")
-        logger.warning("Interaction attempted when bot was disabled. " + contextify(ctx))
+        f_log.warning("Interaction attempted when bot was disabled. " + contextify(ctx))
         return False
 
     if ctx.user.bot:  # We don't want any bots
-        logger.warning("Bot users are not allowed to use commands.")
+        f_log.warning("Bot users are not allowed to use commands.")
         return False
 
     return True
@@ -134,9 +135,20 @@ async def interaction_check(ctx: discord.Interaction) -> bool:
 async def command_error(ctx: discord.Interaction, error_message):
     f_log = log.getChild("error")
     f_log.warning(f"Exception in command: {error_message} {contextify(ctx)}")
-    await ctx.response.send_message(embed=ErrorEmbed(ctx=ctx,
-                                                     what_failed=f"While running the command {ctx.command.name!r}, there was an error {error_message!r}",
-                                                     reason=traceback.format_exc()), ephemeral=True)
+    if sys.exc_info()[0] == CheckFailure:  # This means don't do anything, should have been handled already
+        f_log.info("CheckFailure is the exception! This means we don't do anything with it")
+        return
+
+    if ctx.response.is_done():
+
+        asyncio.create_task(ctx.delete_original_response())
+        await ctx.followup.send(embed=ErrorEmbed(ctx=ctx,
+                                                 what_failed=f"While running the command {ctx.command.name!r}, there was an error {error_message!r}",
+                                                 reason=traceback.format_exc()), ephemeral=True)
+    else:
+        await ctx.response.send_message(embed=ErrorEmbed(ctx=ctx,
+                                                         what_failed=f"While running the command {ctx.command.name!r}, there was an error {error_message!r}",
+                                                         reason=traceback.format_exc()), ephemeral=True)
 
 
 command_root.error(command_error)
@@ -159,21 +171,22 @@ async def on_interaction(ctx: discord.Interaction) -> None:
     custom_id = ctx.data.get("custom_id")  # Get custom ID
     if custom_id is None:  # Not button
         return
-    if custom_id.startswith("join/") or custom_id.startswith("leave/") or custom_id.startswith("start/"):
+    if (custom_id.startswith(BUTTON_PREFIX_JOIN) or custom_id.startswith(BUTTON_PREFIX_LEAVE)
+            or custom_id.startswith(BUTTON_PREFIX_START)):
         await matchmaking_button_callback(ctx)
-    if custom_id.startswith("select_c/"):
+    if custom_id.startswith(BUTTON_PREFIX_SELECT_CURRENT):
         await game_select_callback(ctx, current_turn_required=True)
-    if custom_id.startswith("select_n/"):
+    if custom_id.startswith(BUTTON_PREFIX_SELECT_NO_TURN):
         await game_select_callback(ctx, current_turn_required=False)
-    if custom_id.startswith("c/"):  # Game view button: turn required
+    if custom_id.startswith(BUTTON_PREFIX_CURRENT_TURN):  # Game view button: turn required
         await game_button_callback(ctx, current_turn_required=True)
-    if custom_id.startswith("n/"):  # Game view button: turn not required
+    if custom_id.startswith(BUTTON_PREFIX_NO_TURN):  # Game view button: turn not required
         await game_button_callback(ctx, current_turn_required=False)
-    if custom_id.startswith("invite/"):  # Invite accept button
+    if custom_id.startswith(BUTTON_PREFIX_INVITE):  # Invite accept button
         await invite_accept_callback(ctx)
-    if custom_id.startswith("spectate/"):  # Spectate button
+    if custom_id.startswith(BUTTON_PREFIX_SPECTATE):  # Spectate button
         await spectate_callback(ctx)
-    if custom_id.startswith("peek/"):
+    if custom_id.startswith(BUTTON_PREFIX_PEEK):
         await peek_callback(ctx)
 
 
@@ -184,11 +197,12 @@ async def on_ready() -> None:
     Only things we need to do is register button views and rich presence.
     :return:
     """
+
     global startup_initial_time
 
-    if startup_initial_time:
-        startup_logger.info(f"Client connected after {round((time.time() - startup_initial_time) * 100, 4)}ms.")
-        startup_initial_time = 0  # To prevent reconnects showing this message
+    if startup_initial_time.current_time:
+        startup_logger.info(f"Client connected after {startup_initial_time.current_time}ms.")
+        startup_initial_time.stop()
 
     client.loop.create_task(presence())  # Register presence
 
@@ -353,6 +367,9 @@ async def on_guild_remove(guild: discord.Guild) -> None:
     f_log.info(f"Removed from guild {guild.name!r}! (id={guild.id}). that makes me sad :(")
 
 
+presence_lock = asyncio.Lock()
+
+
 async def presence() -> None:
     """
     Manage the presence of the bot.
@@ -360,26 +377,34 @@ async def presence() -> None:
     :return: None
     """
     presence_logger = logging.getLogger("playcord.presence")
-    # Build presence options
-    options = []
-    for game in GAME_TYPES:
-        info = GAME_TYPES[game]
-        options.append(getattr(importlib.import_module(info[0]), info[1]).name)  # Add game's human readable name
-    options.extend(["paper and pencil games", "fun", "distracting dervishes", "electrifying entertainment",
-                    "gripping games"])  # Add presets
-    while True:
-        # Make a random activity
-        activity = discord.Activity(type=discord.ActivityType.playing,
-                                    name=random.choice(options) + " on Discord",
-                                    state=f"Servicing {len(client.guilds)} servers and {len(client.users)} users")
-        # Change presence
-        try:
-            await client.change_presence(activity=activity, status=discord.Status.online)
-        except Exception as e:
-            log.error(f"Failed to change presence status: {e!r} quitting presence until online again.")
-            return
-        # 15 seconds is the cooldown
-        await asyncio.sleep(15)
+
+    if not presence_lock.locked():
+        async with presence_lock:
+            # Build presence options
+            options = []
+            for game in GAME_TYPES:
+                info = GAME_TYPES[game]
+                options.append(
+                    getattr(importlib.import_module(info[0]), info[1]).name)  # Add game's human readable name
+            options.extend(["paper and pencil games", "fun", "distracting dervishes", "electrifying entertainment",
+                            "gripping games"])  # Add presets
+            while True:
+                # Make a random activity
+                main_status = random.choice(options) + " on Discord"
+                description_status = f"Servicing {len(client.guilds)} servers and {len(client.users)} users"
+                activity = discord.Activity(type=discord.ActivityType.playing,
+                                            name=main_status,
+                                            state=description_status)
+                # Change presence
+                try:
+                    await client.change_presence(activity=activity, status=discord.Status.online)
+                    presence_logger.debug(f"Changed presence to PLAYING {main_status!r} - {description_status!r}")
+                except Exception as presence_exception:
+                    presence_logger.error(f"Failed to change presence status: {presence_exception!r}"
+                                          f" quitting presence until online again.")
+                    return
+                # 15 seconds is the cooldown
+                await asyncio.sleep(15)
 
 
 async def matchmaking_button_callback(ctx: discord.Interaction) -> None:
@@ -421,11 +446,11 @@ async def matchmaking_button_callback(ctx: discord.Interaction) -> None:
                           f" {contextify(ctx)}")
         return
 
-    if interaction_type == "join":
+    if interaction_type == BUTTON_PREFIX_JOIN.rstrip("/"):
         await matchmaker.callback_ready_game(ctx=ctx)
-    elif interaction_type == "leave":
+    elif interaction_type == BUTTON_PREFIX_LEAVE.rstrip("/"):
         await matchmaker.callback_leave_game(ctx=ctx)
-    elif interaction_type == "start":
+    elif interaction_type == BUTTON_PREFIX_START.rstrip("/"):
         await matchmaker.callback_start_game(ctx=ctx)
 
 
@@ -442,7 +467,7 @@ async def game_button_callback(ctx: discord.Interaction, current_turn_required: 
     f_log.info(f"Game button for game {ctx.channel.id} pressed! ID: {ctx.data['custom_id']}"
                f" context: {contextify(ctx)}")  # Log button press
 
-    leading_str = "c/" if current_turn_required else "n/"  # Leading ID of custom ID string
+    leading_str = BUTTON_PREFIX_CURRENT_TURN if current_turn_required else BUTTON_PREFIX_NO_TURN  # Leading ID of custom ID string
 
     data: list[str] = ctx.data['custom_id'].replace(leading_str, "").split("/")
     # Get a list of custom ID: c/game_id/function_id/arguments
@@ -492,7 +517,7 @@ async def game_select_callback(ctx: discord.Interaction, current_turn_required: 
     f_log.info(f"Game select menu for game {ctx.channel.id} pressed! ID: {ctx.data['custom_id']}"
                f" context: {contextify(ctx)}")  # Log button press
 
-    leading_str = "select_c/" if current_turn_required else "select_n/"  # Leading ID of custom ID string
+    leading_str = BUTTON_PREFIX_SELECT_CURRENT if current_turn_required else BUTTON_PREFIX_SELECT_NO_TURN  # Leading ID of custom ID string
 
     data: list[str] = ctx.data['custom_id'].replace(leading_str, "").split("/")
     # Get a list of custom ID: select_[c/n]/game_id/function_id
@@ -540,7 +565,7 @@ async def invite_accept_callback(ctx: discord.Interaction) -> None:
     f_log.debug(f"invite-accept clicked: {contextify(ctx)}")
 
     # Get matchmaker ID
-    matchmaker_id: str = ctx.data['custom_id'].replace('invite/', "")
+    matchmaker_id: str = ctx.data['custom_id'].replace(BUTTON_PREFIX_INVITE, "")
 
     # If matchmaking is still happening, try to accept
     if int(matchmaker_id) in CURRENT_MATCHMAKING:
@@ -557,7 +582,7 @@ async def invite_accept_callback(ctx: discord.Interaction) -> None:
     # Disable invite button for click, regardless of success
     view = discord.ui.View.from_message(ctx.message)
     for button in view.children:
-        if button.custom_id == "invite/" + matchmaker_id:
+        if button.custom_id == BUTTON_PREFIX_INVITE + matchmaker_id:
             button.disabled = True
 
     # Update invite embed
@@ -580,7 +605,7 @@ async def spectate_callback(ctx: discord.Interaction) -> None:
     f_log.debug(f"spectate button clicked: {contextify(ctx)}")
 
     # Get game ID
-    game_id: str = ctx.data['custom_id'].replace('spectate/', "")
+    game_id: str = ctx.data['custom_id'].replace(BUTTON_PREFIX_SPECTATE, "")
 
     thread = client.get_channel(int(game_id))  # Try to get thread
     try:
@@ -607,7 +632,7 @@ async def peek_callback(ctx: discord.Interaction) -> None:
     f_log.debug(f"peeked button clicked: {contextify(ctx)}")
 
     # Get data
-    data = ctx.data['custom_id'].replace('peek/', "").split("/")
+    data = ctx.data['custom_id'].replace(BUTTON_PREFIX_PEEK, "").split("/")
 
     # Unpack variables
     game_message_id: str = data[1]
@@ -708,7 +733,7 @@ async def command_invite(ctx: discord.Interaction,
 
         # Send embed and inviteview (note: invite ID is not game id, but actually the matchmaker's message id)
         await invited_user.send(embed=embed,
-                                view=InviteView(join_button_id="invite/" + str(matchmaker.message.id),
+                                view=InviteView(join_button_id=BUTTON_PREFIX_INVITE + str(matchmaker.message.id),
                                                 game_link=matchmaker.message.jump_url))
         continue
 
@@ -812,25 +837,28 @@ async def command_stats(ctx: discord.Interaction):
     shard_ping = client.latency
     shard_servers = len([guild for guild in client.guilds if guild.shard_id == shard_id])
 
-    embed = CustomEmbed(title='PlayCord Stats <:pointing:1328138400808828969>', color=INFO_COLOR)
+    embed = CustomEmbed(title=f'PlayCord Stats {get_emoji_string("pointing")}',
+                        description=f"This instance of PlayCord is managed by **{MANAGED_BY}**", color=INFO_COLOR)
 
     # Row 1
-    embed.add_field(name='💻 Bot Version:', value=VERSION)
-    embed.add_field(name='🐍 discord.py Version:', value=discord.__version__)
-    embed.add_field(name='🏘️ Total Servers:', value=server_count)
+    embed.add_field(name='💻 Bot version:', value=VERSION)
+    embed.add_field(name='🐍 discord.py version:', value=discord.__version__)
+    embed.add_field(name='👾 Games loaded:', value=len(GAME_TYPES))
 
     # Row 2
-    embed.add_field(name='<:user:1328138963512201256> Total Users:', value=member_count)
-    embed.add_field(name='#️⃣ Shard ID:', value=shard_id)
-    embed.add_field(name='🛜 Shard Ping:', value=str(round(shard_ping * 100, 2)) + " ms")
+    embed.add_field(name='🏘️ Total servers:', value=server_count)
+    embed.add_field(name="💪 Total number of owners:", value=len(OWNERS))
+    embed.add_field(name="💾 Used RAM (this shard)", value=ramcheck.get_ram_usage_mb())
 
-    # Row 3
-    embed.add_field(name='🏘️️ Shard Guilds:', value=shard_servers)
-    embed.add_field(name='👾 Games Loaded:', value=len(GAME_TYPES))
-    embed.add_field(name="⏰ In Matchmaking:", value=len(IN_MATCHMAKING))
+    # Ros 3
+    embed.add_field(name='#️⃣ Shard ID:', value=shard_id)
+    embed.add_field(name='🛜 Shard ping:', value=str(round(shard_ping * 100, 2)) + " ms")
+    embed.add_field(name='🏘️️ Shard servers:', value=shard_servers)
 
     # Row 4
-    embed.add_field(name="🎮 In Game:", value=len(IN_GAME))
+    embed.add_field(name=f'{get_emoji_string("user")} Users:', value=member_count)
+    embed.add_field(name="⏰ Users in matchmaking:", value=len(IN_MATCHMAKING))
+    embed.add_field(name="🎮 Users in game:", value=len(IN_GAME))
 
     await ctx.response.send_message(embed=embed)
 
@@ -860,6 +888,334 @@ async def command_about(ctx: discord.Interaction):
 
     # Send message back
     await ctx.response.send_message(embed=embed)
+
+
+@command_root.command(name="help", description="Get help on how to use the bot")
+async def command_help(ctx: discord.Interaction):
+    """
+    Display help information for the bot.
+    :param ctx: discord Context
+    :return: Nothing
+    """
+    f_log = log.getChild("command.help")
+    f_log.debug(f"/help called: {contextify(ctx)}")
+
+    embed = CustomEmbed(title=f"{NAME} Help 📚", color=INFO_COLOR)
+    embed.description = f"Welcome to {NAME}! Here's how to get started."
+
+    embed.add_field(
+        name="🎮 Starting a Game",
+        value="Use `/play <game>` to start a game. For example: `/play tictactoe`",
+        inline=False
+    )
+    embed.add_field(
+        name="👥 Joining Games",
+        value="Click the **Join** button on any matchmaking message to join a game.",
+        inline=False
+    )
+    embed.add_field(
+        name="📊 Leaderboards",
+        value="Use `/playcord leaderboard <game>` to see the top players for a game.",
+        inline=False
+    )
+    embed.add_field(
+        name="📖 Game Catalog",
+        value="Use `/playcord catalog` to see all available games.",
+        inline=False
+    )
+    embed.add_field(
+        name="👤 Your Profile",
+        value="Use `/playcord profile` to see your stats, or `/playcord profile @user` to see someone else's.",
+        inline=False
+    )
+    embed.add_field(
+        name="⚙️ Commands",
+        value=(
+            "`/playcord stats` - Bot statistics\n"
+            "`/playcord about` - About the bot\n"
+            "`/playcord invite @user` - Invite a user to your game\n"
+            "`/playcord kick @user` - Kick a user from your lobby\n"
+            "`/playcord ban @user` - Ban a user from your lobby"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="🔗 Links",
+        value="[GitHub](https://github.com/PlayCord/bot) | [README](https://github.com/PlayCord/bot/blob/master/README.md)",
+        inline=False
+    )
+
+    await ctx.response.send_message(embed=embed)
+
+
+@command_root.command(name="leaderboard", description="View the leaderboard for a game")
+@app_commands.describe(
+    game="The game to view the leaderboard for",
+    scope="Whether to show server or global leaderboard",
+    page="Page number of the leaderboard"
+)
+@app_commands.choices(scope=[
+    Choice(name="Server", value="server"),
+    Choice(name="Global", value="global")
+])
+async def command_leaderboard(ctx: discord.Interaction, game: str, scope: str = "server", page: int = 1):
+    """
+    Display the leaderboard for a specific game.
+    :param ctx: discord Context
+    :param game: The game type to show leaderboard for
+    :param scope: Whether to show server or global leaderboard
+    :param page: Page number (10 entries per page)
+    :return: Nothing
+    """
+    f_log = log.getChild("command.leaderboard")
+    f_log.debug(f"/leaderboard called for game={game}, scope={scope}, page={page}: {contextify(ctx)}")
+
+    # Validate game type
+    if game not in GAME_TYPES:
+        await ctx.response.send_message(
+            f"Unknown game type: {game}. Use `/playcord catalog` to see available games.",
+            ephemeral=True
+        )
+        return
+
+    # Get game class for display name
+    game_class = getattr(importlib.import_module(GAME_TYPES[game][0]), GAME_TYPES[game][1])
+    game_name = game_class.name
+
+    # Calculate offset for pagination
+    limit = 10
+    offset = (page - 1) * limit
+
+    # Get leaderboard data
+    if scope == "server":
+        leaderboard_data = db.database.get_game_leaderboard(ctx.guild.id, game, limit=limit + offset)
+        scope_text = f"Server Leaderboard for {ctx.guild.name}"
+    else:
+        # For global, we'd need to aggregate across all guilds
+        # For now, just show server leaderboard with a note
+        leaderboard_data = db.database.get_game_leaderboard(ctx.guild.id, game, limit=limit + offset)
+        scope_text = f"Server Leaderboard for {ctx.guild.name}"
+
+    # Slice for current page
+    if leaderboard_data:
+        leaderboard_data = leaderboard_data[offset:offset + limit]
+
+    embed = CustomEmbed(title=f"🏆 {game_name} Leaderboard", color=INFO_COLOR)
+    embed.description = scope_text
+
+    if not leaderboard_data:
+        embed.add_field(name="No Data", value="No players have played this game yet!", inline=False)
+    else:
+        # Build leaderboard display
+        rankings = []
+        for i, entry in enumerate(leaderboard_data, start=offset + 1):
+            user_id = entry['user_id']
+            rating = entry.get('rating', entry.get('mu', 0))
+            matches = entry.get('matches_played', 0)
+
+            # Medal emoji for top 3
+            if i == 1:
+                medal = "🥇"
+            elif i == 2:
+                medal = "🥈"
+            elif i == 3:
+                medal = "🥉"
+            else:
+                medal = f"#{i}"
+
+            rankings.append(f"{medal} <@{user_id}> - **{round(rating)}** ({matches} games)")
+
+        embed.add_field(name="Rankings", value="\n".join(rankings), inline=False)
+
+    embed.set_footer(text=f"Page {page} | Use /playcord leaderboard {game} page:<number> to see more")
+
+    await ctx.response.send_message(embed=embed)
+
+
+@command_root.command(name="catalog", description="View all available games")
+@app_commands.describe(page="Page number of the catalog")
+async def command_catalog(ctx: discord.Interaction, page: int = 1):
+    """
+    Display all available games in a paginated catalog.
+    :param ctx: discord Context
+    :param page: Page number (3 games per page)
+    :return: Nothing
+    """
+    f_log = log.getChild("command.catalog")
+    f_log.debug(f"/catalog called with page={page}: {contextify(ctx)}")
+
+    games_per_page = 3
+    all_games = list(GAME_TYPES.keys())
+    total_pages = (len(all_games) + games_per_page - 1) // games_per_page
+
+    # Validate page number
+    if page < 1 or page > total_pages:
+        page = 1
+
+    # Get games for this page
+    start_idx = (page - 1) * games_per_page
+    end_idx = start_idx + games_per_page
+    page_games = all_games[start_idx:end_idx]
+
+    embed = CustomEmbed(title=f"🎲 {NAME} Game Catalog", color=INFO_COLOR)
+    embed.description = f"Browse all available games. Use `/play <game>` to start playing!"
+
+    for game_id in page_games:
+        game_info = GAME_TYPES[game_id]
+        game_class = getattr(importlib.import_module(game_info[0]), game_info[1])
+
+        # Get game metadata
+        game_name = getattr(game_class, 'name', game_id)
+        game_desc = getattr(game_class, 'description', 'No description available.')
+        game_time = getattr(game_class, 'time', 'Unknown')
+        game_difficulty = getattr(game_class, 'difficulty', 'Unknown')
+        game_players = getattr(game_class, 'players', 'Unknown')
+
+        # Format player count
+        if isinstance(game_players, list):
+            player_text = f"{min(game_players)}-{max(game_players)} players"
+        else:
+            player_text = f"{game_players} players"
+
+        embed.add_field(
+            name=f"🎮 {game_name}",
+            value=(
+                f"{game_desc[:100]}{'...' if len(game_desc) > 100 else ''}\n"
+                f"⏰ {game_time} | 👤 {player_text} | 📈 {game_difficulty}\n"
+                f"**Command:** `/play {game_id}`"
+            ),
+            inline=False
+        )
+
+    embed.set_footer(text=f"Page {page}/{total_pages} | Use /playcord catalog page:<number> to see more")
+
+    await ctx.response.send_message(embed=embed)
+
+
+@command_root.command(name="profile", description="View a player's profile and stats")
+@app_commands.describe(user="The user to view (defaults to yourself)")
+async def command_profile(ctx: discord.Interaction, user: discord.User = None):
+    """
+    Display a user's profile with their game stats.
+    :param ctx: discord Context
+    :param user: The user to view (defaults to command caller)
+    :return: Nothing
+    """
+    f_log = log.getChild("command.profile")
+
+    if user is None:
+        user = ctx.user
+
+    f_log.debug(f"/profile called for user={user.id}: {contextify(ctx)}")
+
+    # Get player data from database
+    player = db.database.get_player(user, ctx.guild.id)
+
+    if player is None:
+        await ctx.response.send_message("Couldn't retrieve player data.", ephemeral=True)
+        return
+
+    embed = CustomEmbed(title=f"👤 {user.display_name}'s Profile", color=INFO_COLOR)
+    embed.set_thumbnail(url=user.display_avatar.url)
+
+    # Get ratings for all games
+    game_stats = []
+    for game_id in GAME_TYPES:
+        game_info = GAME_TYPES[game_id]
+        game_class = getattr(importlib.import_module(game_info[0]), game_info[1])
+        game_name = getattr(game_class, 'name', game_id)
+
+        rating_info = db.database.get_user_game_ratings(user.id, ctx.guild.id, game_id)
+
+        if rating_info and rating_info.get('matches_played', 0) > 0:
+            mu = rating_info.get('mu', 1000)
+            matches = rating_info.get('matches_played', 0)
+            game_stats.append(f"**{game_name}**: {round(mu)} ({matches} games)")
+
+    if game_stats:
+        embed.add_field(name="📊 Game Ratings", value="\n".join(game_stats), inline=False)
+    else:
+        embed.add_field(name="📊 Game Ratings", value="No games played yet!", inline=False)
+
+    # Get match history
+    match_history = db.database.get_user_match_history(user.id, ctx.guild.id, limit=5)
+
+    if match_history:
+        history_lines = []
+        for match in match_history:
+            game_name = match.get('game_name', 'Unknown')
+            ranking = match.get('ranking', '?')
+            mu_delta = match.get('mu_delta', 0)
+            delta_str = f"+{round(mu_delta)}" if mu_delta >= 0 else str(round(mu_delta))
+            history_lines.append(f"**{game_name}** - #{ranking} ({delta_str})")
+        embed.add_field(name="📜 Recent Matches", value="\n".join(history_lines), inline=False)
+    else:
+        embed.add_field(name="📜 Recent Matches", value="No recent matches.", inline=False)
+
+    # Total matches count
+    total_matches = db.database.count_matches_for_user(user.id, ctx.guild.id)
+    embed.add_field(name="🎮 Total Games Played", value=str(total_matches), inline=True)
+
+    await ctx.response.send_message(embed=embed)
+
+
+@command_root.command(name="settings", description="Change settings for your current game lobby")
+@app_commands.describe(
+    rated="Whether the game should be rated",
+    private="Whether the game should be private"
+)
+async def command_settings(ctx: discord.Interaction, rated: bool = None, private: bool = None):
+    """
+    Change settings for the current matchmaking lobby.
+    :param ctx: discord Context
+    :param rated: Whether the game should be rated
+    :param private: Whether the game should be private
+    :return: Nothing
+    """
+    f_log = log.getChild("command.settings")
+    f_log.debug(f"/settings called: rated={rated}, private={private} {contextify(ctx)}")
+
+    # Check if user is in matchmaking
+    id_matchmaking = {p.id: q for p, q in IN_MATCHMAKING.items()}
+
+    if ctx.user.id not in id_matchmaking:
+        await ctx.response.send_message(
+            "You aren't in matchmaking. Start a game first with `/play <game>`.",
+            ephemeral=True
+        )
+        return
+
+    matchmaker: MatchmakingInterface = id_matchmaking[ctx.user.id]
+
+    # Only creator can change settings
+    if matchmaker.creator.id != ctx.user.id:
+        await ctx.response.send_message(
+            "Only the game creator can change settings.",
+            ephemeral=True
+        )
+        return
+
+    changes = []
+
+    if rated is not None and rated != matchmaker.rated:
+        matchmaker.rated = rated
+        changes.append(f"Rated: {'Yes' if rated else 'No'}")
+
+    if private is not None and private != matchmaker.private:
+        matchmaker.private = private
+        changes.append(f"Private: {'Yes' if private else 'No'}")
+
+    if changes:
+        await matchmaker.update_embed()
+        await ctx.response.send_message(
+            f"Settings updated:\n" + "\n".join(changes),
+            ephemeral=True
+        )
+    else:
+        await ctx.response.send_message(
+            "No settings were changed.",
+            ephemeral=True
+        )
 
 
 # Callbacks
@@ -894,7 +1250,7 @@ async def begin_game(ctx: discord.Interaction, game_type: str, rated: bool = Tru
                                 description="This command cannot be run in public or private threads.", ephemeral=True)
 
     # Start a "Loading" screen as we transition from matchmaking to GameOverviewEmbed
-    await ctx.response.send_message(embed=CustomEmbed(description="<a:loading:1318216218116620348>").remove_footer())
+    await ctx.response.send_message(embed=CustomEmbed(description=get_emoji_string("loading")).remove_footer())
     game_overview_message = await ctx.original_response()
 
     # Create MatchmakingInterface
@@ -922,8 +1278,8 @@ async def handle_move(ctx: discord.Interaction, name, arguments) -> None:
     # Must be run in private thread
     if ctx.channel.type != discord.ChannelType.private_thread:
         f_log.info(f"invalid channel type triggered on handling move {contextify(ctx)}")
-        await send_simple_embed(ctx, "Move commands can only be run in their respective threads",
-                                "Please use a bot-created thread to move. :) ", responded=True)
+        await send_simple_embed(ctx, "Move commands can only be run during a game",
+                                "Please start a game to use this command :) ", responded=True)
         return
     # Must be in current game
     if ctx.channel.id not in CURRENT_GAMES.keys():
@@ -954,73 +1310,74 @@ async def handle_autocomplete(ctx: discord.Interaction, function, current: str, 
     """
 
     # Get the current game
-    logger = log.getChild("callback.handle_autocomplete")
+    f_log = log.getChild("callback.handle_autocomplete")
     try:
         # Try to get the GameInterface object
         game_view = CURRENT_GAMES[ctx.channel.id]
     except KeyError:  # Game not in this channel
-        logger.info(f"There is no game from channel #{ctx.channel.mention} (id={ctx.channel.id}). Not autocompleting."
-                    f" context: {contextify(ctx)}")
+        f_log.info(f"There is no game from channel #{ctx.channel.mention} (id={ctx.channel.id}). Not autocompleting."
+                   f" context: {contextify(ctx)}")
 
         # Use the autocomplete choices as a cheese to inform user
         return [app_commands.Choice(name="There is no game in this channel!", value="")]
 
     # Get the player who called this function from database
-    player = database.get_player(game_view.game_type, ctx.user)
+    player = db.database.get_player(ctx.user, ctx.guild.id)
     try:
         # attempt to retrieve data from autocomplete cache
         player_options = AUTOCOMPLETE_CACHE[ctx.channel.id][ctx.user.id][function][argument][current]
-        logger.info(f"Successfully used autocomplete cache:"
-                    f" function={function} argument={argument}, current={current!r} context: {contextify(ctx)}")
+        f_log.info(f"Successfully used autocomplete cache:"
+                   f" function={function} argument={argument}, current={current!r} context: {contextify(ctx)}")
     except KeyError:
         ac_callback = None
+        matched_option = None
         # Get the autocomplete callback function for this argument
         # This MUST exist because this function was called
         for move in game_view.game.moves:
+            if move.options is None:
+                continue
             for option in move.options:
                 if option.name == argument:
-                    ac_callback = getattr(game_view.game, option.autocomplete)
+                    ac_callback = getattr(game_view.game, option.autocomplete, None)
+                    matched_option = option
                     break
+            if matched_option is not None:
+                break
+
+        # Check if we found a matching option
+        if matched_option is None or ac_callback is None:
+            f_log.critical(f"handle_autocomplete was called without a matching callback function."
+                           f" function={function} argument={argument},"
+                           f" options={game_view.game.moves}, current={current!r} context: {contextify(ctx)}")
+            return [app_commands.Choice(name="Autocomplete function is not defined!", value="")]
 
         # Force reload: save autocomplete cache data.
-        if not option.force_reload:  # If we can save data, do that
-            try:
-                # Get the options for the player from the backend
-                player_options = ac_callback(player)
+        if not matched_option.force_reload:  # If we can save data, do that
+            # Get the options for the player from the backend
+            player_options = ac_callback(player)
 
-                # Collection of if statements to make sure correct structure is built, not sure of a better way lol
-                if ctx.channel.id not in AUTOCOMPLETE_CACHE:
-                    AUTOCOMPLETE_CACHE[ctx.channel.id] = {}
+            # Collection of if statements to make sure correct structure is built, not sure of a better way lol
+            if ctx.channel.id not in AUTOCOMPLETE_CACHE:
+                AUTOCOMPLETE_CACHE[ctx.channel.id] = {}
 
-                if ctx.user.id not in AUTOCOMPLETE_CACHE[ctx.channel.id]:
-                    AUTOCOMPLETE_CACHE[ctx.channel.id][ctx.user.id] = {}
+            if ctx.user.id not in AUTOCOMPLETE_CACHE[ctx.channel.id]:
+                AUTOCOMPLETE_CACHE[ctx.channel.id][ctx.user.id] = {}
 
-                if function not in AUTOCOMPLETE_CACHE[ctx.channel.id][ctx.user.id]:
-                    AUTOCOMPLETE_CACHE[ctx.channel.id][ctx.user.id][function] = {}
+            if function not in AUTOCOMPLETE_CACHE[ctx.channel.id][ctx.user.id]:
+                AUTOCOMPLETE_CACHE[ctx.channel.id][ctx.user.id][function] = {}
 
-                if argument not in AUTOCOMPLETE_CACHE[ctx.channel.id][ctx.user.id][function]:
-                    AUTOCOMPLETE_CACHE[ctx.channel.id][ctx.user.id][function][argument] = {}
+            if argument not in AUTOCOMPLETE_CACHE[ctx.channel.id][ctx.user.id][function]:
+                AUTOCOMPLETE_CACHE[ctx.channel.id][ctx.user.id][function][argument] = {}
 
-                # Actually save data to autocomplete cache
-                AUTOCOMPLETE_CACHE[ctx.channel.id][ctx.user.id][function][argument].update({current: player_options})
-            except TypeError:
-                logger.critical(f"handle_autocomplete was called without a matching callback function."
-                                f" function={function} argument={argument},"
-                                f" options={game_view.game.options}, current={current!r} context: {contextify(ctx)}")
-                return [app_commands.Choice(name="Autocomplete function is not defined!", value="")]
+            # Actually save data to autocomplete cache
+            AUTOCOMPLETE_CACHE[ctx.channel.id][ctx.user.id][function][argument].update({current: player_options})
 
         else:
             # No autocomplete cache
-            logger.info(f"force_reload blocked autocomplete cache function={function} argument={argument},"
-                        f" options={game_view.game.options}, current={current!r} {contextify(ctx)}")
+            f_log.info(f"force_reload blocked autocomplete cache function={function} argument={argument},"
+                       f" options={game_view.game.moves}, current={current!r} {contextify(ctx)}")
 
-            try:
-                player_options = ac_callback(player)  # try to get autocomplete data
-            except TypeError:
-                logger.critical(f"handle_autocomplete was called without a matching callback function."
-                                f" function={function} argument={argument},"
-                                f" options={game_view.game.options}, current={current!r} context: {contextify(ctx)}")
-                return [app_commands.Choice(name="Autocomplete function is not defined!", value="")]
+            player_options = ac_callback(player)  # get autocomplete data
 
     # Get all valid options based on what is currently typed (e.g. only allow words containing "amo" for a typed "amo"
     valid_player_options = []
@@ -1070,6 +1427,9 @@ def encode_argument(argument_name, argument_information) -> str:
         if option_type == AppCommandOptionType.integer:
             range_type = int
         elif option_type == AppCommandOptionType.string:
+            range_type = str
+        else:
+            # Fallback for unexpected types
             range_type = str
 
         # Extract min/max
@@ -1180,7 +1540,8 @@ def build_function_definitions() -> dict[Group, list[Any]]:
             this_move_arguments = arguments[this_move.name]
 
             # Command group for this game's move commands
-            dynamic_command_group = app_commands.Group(name=game, description=game_class.move_command_group_description)
+            dynamic_command_group = app_commands.Group(name=game, description=game_class.move_command_group_description,
+                                                       guild_only=True)
             context[dynamic_command_group] = []
 
             # Encode decorators to text
@@ -1232,7 +1593,8 @@ if __name__ == "__main__":
         for group in commands:
             tree.add_command(group)
             for command in commands[group]:
-                startup_logger.debug(f"Registering command:\n{command}")
+                # Remove trailing and leading newlines and log the command
+                startup_logger.debug(f"Registering command:\n{command.strip("\n")}")
                 exec(command)  # Add the command
 
         startup_logger.info(f"All hooks registered.")
@@ -1249,8 +1611,9 @@ if __name__ == "__main__":
         tree.add_command(command_root)
 
         # Run the bot :)
-        startup_logger.info(f"Starting client after {round((time.time() - startup_initial_time) * 100, 4)}ms")
+        startup_logger.info(
+            f"Starting client after {startup_initial_time.current_time}ms")
         client.run(config[CONFIG_BOT_SECRET], log_handler=None)
     except Exception as e:  # Something went wrong
-        log.critical(str(e))
-        log.critical(ERROR_INCORRECT_SETUP)
+        startup_logger.critical(str(e))
+        startup_logger.critical(ERROR_INCORRECT_SETUP)

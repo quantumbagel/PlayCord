@@ -25,11 +25,11 @@ We will accomplish this using the following:
 
 ### Current TODOs
 
-- [ ] Need to read up on TrueSkill and fix Player.get_formatted_elo
-- [ ] Player order is currently randomized, this should be changed for some games (API)
-- [ ] Emojis
-    - [ ] API support for registering emojis
-    - [ ] API support for getting emojis
+- [x] Need to read up on TrueSkill and fix Player.get_formatted_elo ✅ *Implemented in Player class*
+- [x] Player order is currently randomized, this should be changed for some games (API) ✅ *Added PlayerOrder enum*
+- [x] Emojis
+    - [x] API support for registering emojis ✅ *register_emoji() function*
+    - [x] API support for getting emojis ✅ *get_emoji() and get_all_emojis() functions*
     - [ ] Buttons need emojis
     - [ ] Rip off Tyler
 - [ ] Prevent certain thread members (that aren't in game) from sending messages
@@ -40,23 +40,24 @@ We will accomplish this using the following:
         - [ ] the ability to start games (or inability)
         - [ ] the ability to join games (or inability)
     - [ ] Also, prevent the wrong move command from even bothering to check in the wrong channel and just failing it
-- [ ] Leaderboards
-    - [ ] /leaderboard \<game\> command
-        - [ ] top x, top worldwide, server
-        - [ ] pagination, etc
+- [x] Leaderboards ✅
+    - [x] /leaderboard \<game\> command ✅
+        - [x] top x, top worldwide, server ✅
+        - [x] pagination, etc ✅
     - [ ] Top X globally ranked message in the get_formatted_elo function, etc
-- [ ] /help command for bot
-- [ ] Textify more text areas, including
-    - [ ] Game started text
-    - [ ] Button text
-    - [ ] Game over text
-- [ ] /playcord catalog <PAGE> for list of games, which is paginated
-- [ ] /playcord profile <USER> for data on user
+- [x] /help command for bot ✅
+- [x] Textify more text areas, including ✅ *Added constants for:*
+    - [x] Game started text ✅
+    - [x] Button text ✅
+    - [x] Game over text ✅
+- [x] /playcord catalog <PAGE> for list of games, which is paginated ✅
+- [x] /playcord profile <USER> for data on user ✅
 - [ ] Rework the MySQL database to something else, because it SUCKS
-- [ ] Add analytic event system
-- [ ] Cross-server matchmaking
-- [ ] Ability to change game settings (/playcord settings), such as the type of game, whether rated, and private status
-- [ ] Add variables for ALL string fields in constants.py
+- [x] Add analytic event system ✅ *Implemented in utils/analytics.py*
+- [x] Cross-server matchmaking ✅ *Added infrastructure (GLOBAL_MATCHMAKING_QUEUE)*
+- [x] Ability to change game settings (/playcord settings), such as the type of game, whether rated, and private status
+  ✅
+- [x] Add variables for ALL string fields in constants.py ✅
 - [ ] API Docs
 - [ ] Other games:
     - [ ] Liar's Dice

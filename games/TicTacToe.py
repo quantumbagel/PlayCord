@@ -1,9 +1,10 @@
 from api.Arguments import String
 from api.Command import Command
+from api.Game import Game
 from api.MessageComponents import Button, ButtonStyle, DataTable
 
 
-class TicTacToeGame:
+class TicTacToeGame(Game):
     begin_command_description = "The classic game of Xs and Os, brought to discord"
     move_command_group_description = "Commands for TicTacToe"
     description = ("Tic-Tac-Toe on Discord! The game is pretty self-explanatory,"
@@ -28,7 +29,7 @@ class TicTacToeGame:
         self.size = 3
 
         # Dynamically updated information
-        self.board = [[Property() for _ in range(self.size)] for _ in range(self.size)]
+        self.board = [[BoardCell() for _ in range(self.size)] for _ in range(self.size)]
         self.turn = 0
         self.row_count = [0 for _ in range(self.size)]
         self.column_count = [0 for _ in range(self.size)]
@@ -106,7 +107,9 @@ class TicTacToeGame:
             return ids  # Return list of both IDs
 
 
-class Property:
+class BoardCell:
+    """Represents a cell on the game board that can be owned by a player."""
+
     def __init__(self, player=None):
         if player is not None:
             self.id = player.id
@@ -119,7 +122,7 @@ class Property:
         self.owner = player
 
     def __repr__(self):
-        return f"Property(id={self.id})"
+        return f"BoardCell(id={self.id})"
 
     def __eq__(self, other):
         if other is None:

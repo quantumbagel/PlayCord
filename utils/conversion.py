@@ -17,14 +17,14 @@ def column_names(players: list[InternalPlayer] | set[InternalPlayer]) -> str:
     return "\n".join([u.mention for u in players])
 
 
-def column_elo(players: list[InternalPlayer] | set[InternalPlayer]) -> str:
+def column_elo(players: list[InternalPlayer] | set[InternalPlayer], game_type: str) -> str:
     """
     Convert a list of players into a string representing the list of players
 
     238
     237?
     """
-    return "\n".join([u.get_formatted_elo() for u in players])
+    return "\n".join([u.get_formatted_elo(game_type) for u in players])
 
 
 def column_creator(players: list[InternalPlayer] | set[InternalPlayer], creator: InternalPlayer | User) -> str:
@@ -134,7 +134,12 @@ def contextify(ctx: discord.Interaction | discord.Member):
     :param ctx: discord context
     :return: a string representing detailed information about the interaction
     """
+
+    is_guild_command = ctx.guild is not None
+    guild_id = ctx.guild.id if is_guild_command else None
+    guild_name = ctx.guild.name if is_guild_command else None
+
     if type(ctx) == discord.Interaction:
-        return f"guild_id={ctx.guild.id} guild_name={ctx.guild.name!r} user_id={ctx.user.id}, user_name={ctx.user.name}, is_bot={ctx.user.bot}, data={ctx.data}, type={ctx.type!r}"
+        return f"guild_id={guild_id} guild_name={guild_name!r} user_id={ctx.user.id}, user_name={ctx.user.name}, is_bot={ctx.user.bot}, data={ctx.data}, type={ctx.type!r}"
     elif type(ctx) == discord.Member:
-        return f"guild_id={ctx.guild.id} guild_name={ctx.guild.name!r} user_id={ctx.user.id}, user_name={ctx.user.name}, is_bot={ctx.user.bot}, data={ctx.data}, type={ctx.type!r}"
+        return f"guild_id={guild_id} guild_name={guild_name!r} user_id={ctx.user.id}, user_name={ctx.user.name}, is_bot={ctx.user.bot}, data={ctx.data}, type={ctx.type!r}"

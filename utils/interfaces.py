@@ -5,18 +5,21 @@ import logging
 import random
 import traceback
 import typing
+from typing import Any
 
 import trueskill
 
+from api.Game import PlayerOrder
 from api.Player import Player
 from api.Response import Response
 from configuration.constants import *
+from utils import database as db
 from utils.analytics import Timer
 from utils.conversion import column_creator, column_elo, column_names, column_turn, contextify, player_representative, \
     player_verification_function, textify
-from utils.database import InternalPlayer, get_player, get_shallow_player, internal_player_to_player, \
-    update_db_rankings, update_player
+from utils.database import InternalPlayer, get_shallow_player, internal_player_to_player
 from utils.embeds import CustomEmbed, ErrorEmbed, GameOverEmbed, GameOverviewEmbed
+from utils.emojis import get_emoji_string
 from utils.views import MatchmakingView, SpectateView
 
 
@@ -27,24 +30,52 @@ class GameInterface:
     Discord <--> Bot <--> GameInterface <--> Game
     """
 
-    def __init__(self, game_type: str, status_message: discord.WebhookMessage, creator: discord.User,
-                 players: list[InternalPlayer], rated: bool) -> None:
+    def __init__(self, game_type: str, status_message: discord.InteractionMessage, creator: discord.User,
+                 players: list[InternalPlayer], rated: bool, game_id: int) -> None:
         """
         Create the GameInterface
         :param game_type: The game type as defined in constants.py
         :param status_message: The message already created by the bot outside the not-yet-existent thread
-        :param creator: the User (discord) who created the lobby TODO: change to Player.py
+        :param creator: the User (discord) who created the lobby TODO: change to Player
         :param players: A list of Player.py objects representing the players
         :param rated: Whether the game is rated (ratings change based on outcome)
+        :param game_id: The game ID in the database
         """
         # The message created by the bot outside the not-yet-existent thread
+        self.game_id = game_id
         self.status_message = status_message
         # The game type
         self.game_type = game_type
         # Who created the lobby
         self.creator = creator
 
-        random.shuffle(players)  # Randomize player order TODO: rework with introduction of team-based games
+        # Get the game class to check player_order setting
+        self.module = importlib.import_module(GAME_TYPES[game_type][0])  # Game module
+        game_class = getattr(self.module, GAME_TYPES[game_type][1])
+
+        # Order players based on game's player_order setting
+        player_order = getattr(game_class, 'player_order', PlayerOrder.RANDOM)
+
+        if player_order == PlayerOrder.RANDOM:
+            random.shuffle(players)
+        elif player_order == PlayerOrder.PRESERVE:
+            pass  # Keep order as-is
+        elif player_order == PlayerOrder.CREATOR_FIRST:
+            # Move creator to front, shuffle the rest
+            creator_player = None
+            other_players = []
+            for p in players:
+                if p.id == creator.id:
+                    creator_player = p
+                else:
+                    other_players.append(p)
+            random.shuffle(other_players)
+            if creator_player:
+                players = [creator_player] + other_players
+            else:
+                players = other_players
+        elif player_order == PlayerOrder.REVERSE:
+            players = list(reversed(players))
 
         # All players in the game
         self.players = players
@@ -53,10 +84,10 @@ class GameInterface:
         self.game_message = None  # The message representing the game after self.setup() is called
         self.info_message = None  # The message showing game info, whose turn, and what players.
         # also made by self.setup()
-        self.module = importlib.import_module(GAME_TYPES[game_type][0])  # Game module
         # Game class instantiated with the players
-        self.game = (getattr(self.module, GAME_TYPES[game_type][1])
-                     ([Player(mu=p.mu, sigma=p.sigma, ranking=p.ranking, id=p.id) for p in players]))
+        self.game = (game_class
+                     ([Player(mu=getattr(p, self.game_type).mu, sigma=getattr(p, self.game_type).sigma, ranking=None,
+                              id=p.id) for p in players]))
 
         self.current_turn = None
         self.logger = logging.getLogger(f"GameInterface[{game_type}]")
@@ -94,9 +125,9 @@ class GameInterface:
 
         asyncio.create_task(add_new_members_to_thread())  # Nonblocking
 
-        game_info_embed = CustomEmbed(description="<a:loading:1318216218116620348>").remove_footer()
+        game_info_embed = CustomEmbed(description=get_emoji_string("loading")).remove_footer()
         # Temporary embed TODO: remove this and make it cleaner while still guaranteeing the bot gets the first message
-        getting_ready_embed = CustomEmbed(description="<a:loading:1318216218116620348>").remove_footer()
+        getting_ready_embed = CustomEmbed(description=get_emoji_string("loading")).remove_footer()
 
         # Set the thread and game message in the class
         self.thread = game_thread
@@ -157,7 +188,7 @@ class GameInterface:
                     function_to_call = callback
 
                 move_response: Response = getattr(self.game, function_to_call)(
-                    internal_player_to_player(get_player(self.game_type, ctx.user)),
+                    internal_player_to_player(db.database.get_player(ctx.user, ctx.guild.id), self.game_type),
                     **arguments)
             except Exception as e:
                 log.error(f"Error {e!r} with command {name!r} with arguments {arguments!r}"
@@ -241,7 +272,7 @@ class GameInterface:
             try:
                 # Call the move function with arguments (player, <expanded arguments>)
                 move_response: Response = callback_function(
-                    internal_player_to_player(get_player(self.game_type, ctx.user)),
+                    internal_player_to_player(db.database.get_player(ctx.user, ctx.guild.id), self.game_type),
                     **type_converted_arguments)
             except Exception as e:
                 log.error(f"Error {e!r} with command {name!r} with arguments {arguments!r}"
@@ -301,7 +332,8 @@ class GameInterface:
             try:
                 # Call the move function with arguments (player, values)
                 move_response: Response = callback_function(
-                    internal_player_to_player(get_player(self.game_type, ctx.user)), ctx.data["values"])
+                    internal_player_to_player(db.database.get_player(ctx.user, ctx.guild.id), self.game_type),
+                    ctx.data["values"])
             except Exception as e:
                 log.error(f"Error {e!r} with command {name!r}"
                           f" context: {contextify(ctx)}.")
@@ -403,7 +435,7 @@ class GameInterface:
 
         # Add info embed data
         info_embed.add_field(name="Players:", value=column_names(self.players))
-        info_embed.add_field(name="Ratings:", value=column_elo(self.players))
+        info_embed.add_field(name="Ratings:", value=column_elo(self.players, self.game_type))
         info_embed.add_field(name="Turn:", value=column_turn(self.players, self.current_turn))
 
         # Edit the game and info messages with the new embeds
@@ -442,7 +474,7 @@ class GameInterface:
             while self.status_message is None:
                 await asyncio.sleep(1)
             await self.status_message.edit(
-                embed=GameOverviewEmbed(self.game.name, self.rated, self.players, self.current_turn))
+                embed=GameOverviewEmbed(self.game.name, self.game_type, self.rated, self.players, self.current_turn))
 
         asyncio.create_task(edit_status_message())
 
@@ -485,7 +517,7 @@ class MatchmakingInterface:
         self.private = private
 
         # Allowed players for whitelist
-        self.whitelist = {get_player(game_type, creator)}
+        self.whitelist = {db.database.get_player(creator, message.guild.id)}
 
         # Disallowed players (blacklist
         self.blacklist = set()
@@ -559,7 +591,7 @@ class MatchmakingInterface:
 
         # Add columns for names, elo, and creator status
         embed.add_field(name="Players:", value=column_names(self.queued_players), inline=True)
-        embed.add_field(name="Rating:", value=column_elo(self.queued_players), inline=True)
+        embed.add_field(name="Rating:", value=column_elo(self.queued_players, self.game_type), inline=True)
         embed.add_field(name="Creator:", value=column_creator(self.queued_players, self.creator), inline=True)
 
         # Add whitelist or blacklist depending on private status
@@ -593,7 +625,7 @@ class MatchmakingInterface:
         :return: whether the invite succeeded or failed
         """
 
-        player = get_shallow_player(self.game_type, ctx.user)
+        player = get_shallow_player(ctx.user)
 
         # Get logger
         log = self.logger.getChild("accept_invite")
@@ -639,7 +671,7 @@ class MatchmakingInterface:
         :return: Error code or None if no error
         """
         log = self.logger.getChild("ban")
-        new_player = get_player(self.game_type, player)
+        new_player = db.database.get_player(player, self.message.guild.id)
         log.debug(f"Attempting to ban player {new_player} for reason {reason!r}...")
         if new_player is None:  # Couldn't retrieve information, so don't join them
             log.error(f"Error banning {new_player}: couldn't connect to the database!")
@@ -691,7 +723,7 @@ class MatchmakingInterface:
         :return: error or None if no error
         """
         log = self.logger.getChild("kick")
-        new_player = get_shallow_player(self.game_type, player)
+        new_player = get_shallow_player(player)
         log.debug(f"Attempting to kick player {new_player} for reason {reason!r}...")
         if new_player is None:  # Couldn't retrieve information, so don't join them
             log.error(f"Error kicking {new_player}: couldn't connect to the database!")
@@ -730,7 +762,7 @@ class MatchmakingInterface:
         :return: Nothing
         """
         log = self.logger.getChild("ready_game")
-        new_player = get_shallow_player(self.game_type, ctx.user)
+        new_player = get_shallow_player(ctx.user)
         log.debug(f"Attempting to join the game... {contextify(ctx)}")
         if ctx.user.id in [p.id for p in self.queued_players]:  # Can't join if you are already in
             log.info(f"Attempted to join player {new_player} but failed because they were already in the queue."
@@ -767,7 +799,7 @@ class MatchmakingInterface:
         """
         log = self.logger.getChild("leave_game")
         log.debug(f"Attempting to leave the game... {contextify(ctx)}")
-        player = get_shallow_player(self.game_type, ctx.user)
+        player = get_shallow_player(ctx.user)
 
         if player.id not in [p.id for p in self.queued_players]:  # Can't leave if you weren't even there
             log.info(f"Attempted to remove player {player} but failed because they weren't in the queue to begin with."
@@ -806,7 +838,7 @@ class MatchmakingInterface:
         :return: Nothing
         """
         log = self.logger.getChild("start_game")
-        player = get_shallow_player(self.game_type, ctx.user)
+        player = get_shallow_player(ctx.user)
         log.debug(f"Attempting to start the game... {contextify(ctx)}")
 
         if ctx.user.id != self.creator.id:  # Don't have permissions to start the game
@@ -822,7 +854,7 @@ class MatchmakingInterface:
                   f"{contextify(ctx)}")
         # Start the GameInterface
 
-        await self.message.edit(embed=CustomEmbed(description="<a:loading:1318216218116620348>").remove_footer(),
+        await self.message.edit(embed=CustomEmbed(description=get_emoji_string("loading")).remove_footer(),
                                 view=None)
         await successful_matchmaking(interface=self)
 
@@ -850,7 +882,10 @@ async def successful_matchmaking(interface: MatchmakingInterface) -> None:
     CURRENT_MATCHMAKING.pop(message.id)  # Remove the MatchmakingInterface from the CURRENT_MATCHMAKING tracker
 
     # Set up a new GameInterface
-    game = GameInterface(game_type, message, creator, list(players), rated)
+    new_game_id = db.database.create_game(game_name=game_type, guild_id=message.guild.id,
+                                          participants=[player.id for player in players],
+                                          is_rated=rated)
+    game = GameInterface(game_type, message, creator, list(players), rated, new_game_id)
     await game.setup()  # Setup thread and other stuff
 
     # Register the game to the channel it's in
@@ -868,13 +903,15 @@ async def successful_matchmaking(interface: MatchmakingInterface) -> None:
     await game.display_game_state()  # Send the game display state
 
 
-async def rating_groups_to_string(rankings: list[int], groups: list[dict[InternalPlayer, trueskill.Rating]]) \
-        -> tuple[str, dict[str, typing.Any]]:
+async def rating_groups_to_string(rankings: list[int], groups: list[dict[InternalPlayer, trueskill.Rating]],
+                                  game_type: str) \
+        -> tuple[str, dict[int, dict[str, str | bool | int | Any]]]:
     """
     Converts the rankings and groups from a rated game into a string representing the outcome of the game.
     :param rankings: Rankings (format: list of places such as [1, 1, 2, 3] to correlate with groups)
     :param groups: groups (format: [{player: player_rating}] where player is a Player.py object and player_rating
      is an trueskill.Rating object
+    :param game_type: The game type, used to extract the correct rating from the player.
     :return: String representing the outcome of the game (format:
     1. PlayerInFirst
     2T. PlayerInSecond
@@ -909,7 +946,8 @@ async def rating_groups_to_string(rankings: list[int], groups: list[dict[Interna
             nums_current_place = 1
 
         # Extract starting and ending rating variables
-        starting_mu, starting_sigma = pre_rated_player.mu, pre_rated_player.sigma
+        starting_mu, starting_sigma = (getattr(pre_rated_player, game_type).mu,
+                                       getattr(pre_rated_player, game_type).sigma)
         aftermath_mu, aftermath_sigma = all_ratings[pre_rated_player].mu, all_ratings[pre_rated_player].sigma
 
         # Change in ELO
@@ -919,9 +957,10 @@ async def rating_groups_to_string(rankings: list[int], groups: list[dict[Interna
             mu_delta = "+" + mu_delta
 
         # Add data for the player to player_ratings
-        player_ratings.update({pre_rated_player.id: {"old_rating": round(starting_mu), "delta": mu_delta,
+        player_ratings.update({pre_rated_player.id: {"old_mu": round(starting_mu), "delta": mu_delta,
                                                      "place": current_place, "tied": rankings.count(rankings[i]) > 1,
-                                                     "new_rating": aftermath_mu,
+                                                     "new_mu": aftermath_mu,
+                                                     "old_sigma": starting_sigma,
                                                      "new_sigma": aftermath_sigma}})
     # Concatenate to
     # 1. PlayerOne 1 (+384)
@@ -929,7 +968,7 @@ async def rating_groups_to_string(rankings: list[int], groups: list[dict[Interna
     # 3. PlayerThreeWhoSucks 20 (-20)
     player_string = "\n".join([
         f"{player_ratings[p]["place"]}{"T" if player_ratings[p]["tied"] else ""}."
-        f"{LONG_SPACE_EMBED}<@{p}>{LONG_SPACE_EMBED}{player_ratings[p]["old_rating"]}"
+        f"{LONG_SPACE_EMBED}<@{p}>{LONG_SPACE_EMBED}{player_ratings[p]["old_mu"]}"
         f"{LONG_SPACE_EMBED}({player_ratings[p]["delta"]})"
         for p in player_ratings])
 
@@ -987,12 +1026,13 @@ async def game_over(interface: GameInterface, outcome: str | InternalPlayer | li
     """
 
     # Extract class variables
-    interface.ending_game = True
+    interface.ending_game = True  # Prevent moves from being attempted after game is over
     game_type = interface.game_type
     thread = interface.thread
     outbound_message = interface.status_message
     rated = interface.rated
     players = interface.players
+    game_id = interface.game_id
 
     # Get environment constants
     sigma = MU * GAME_TRUESKILL[game_type]["sigma"]
@@ -1004,7 +1044,7 @@ async def game_over(interface: GameInterface, outcome: str | InternalPlayer | li
     environment = trueskill.TrueSkill(mu=MU, sigma=sigma, beta=beta, tau=tau, draw_probability=draw,
                                       backend="mpmath")
 
-    # There are three cases: str (error) Player.py (one person won) list[list[Player.py]] (detailed ranking)
+    # There are three cases: str (error) Player (one person won) list[list[Player]] (detailed ranking)
     if isinstance(outcome, str):  # Error
         game_over_embed = ErrorEmbed(what_failed="Error during a move!", reason=outcome)
         # Send the embed
@@ -1019,9 +1059,12 @@ async def game_over(interface: GameInterface, outcome: str | InternalPlayer | li
             winner = environment.create_rating(outcome.mu, outcome.sigma)
 
             # All the losers
-            losers = [{p: environment.create_rating(p.mu, p.sigma)} for p in players if p != outcome]
+            losers = [{p: environment.create_rating(getattr(p, game_type).mu, getattr(p, game_type).sigma)}
+                      for p in players if p != outcome]
 
-            rating_groups = [{outcome: winner}, *losers]  # Make the rating groups
+            rating_groups = [{InternalPlayer(ratings={game_type: {"mu": outcome.mu, "sigma": outcome.sigma}},
+                                             user=None, metadata={}, id=outcome.id): winner},
+                             *losers]  # Make the rating groups, cast Player to InternalPlayer
             rankings = [0, *[1 for _ in range(len(players) - 1)]]  # Rankings = [0, 1, 1, ..., 1] for this case
 
         else:  # More generic position placement
@@ -1040,7 +1083,21 @@ async def game_over(interface: GameInterface, outcome: str | InternalPlayer | li
 
         # Rerate the groups
         adjusted_rating_groups = environment.rate(rating_groups=rating_groups, ranks=rankings)
-        player_string, player_ratings = await rating_groups_to_string(rankings, adjusted_rating_groups)
+        player_string, player_ratings = await rating_groups_to_string(rankings, adjusted_rating_groups, game_type)
+        print(rankings, rating_groups, adjusted_rating_groups, player_string, player_ratings)
+        ratings = {}
+        for player in player_ratings:
+            data = player_ratings[player]
+            new_mu = data["new_mu"]
+            new_sigma = data["new_sigma"]
+            ratings.update({player: {"uid": player,
+                                     "new_mu": new_mu,
+                                     "new_sigma": new_sigma,
+                                     "mu_delta": new_mu - data["old_mu"],
+                                     "sigma_delta": new_sigma - data["old_sigma"], "ranking": 3}})
+
+        db.database.end_game(match_id=game_id, game_name=game_type, rating_updates=ratings, final_scores=None)
+
 
     else:  # Non-rated game
 
@@ -1079,12 +1136,12 @@ async def game_over(interface: GameInterface, outcome: str | InternalPlayer | li
     # Close the game thread
     await thread.edit(locked=True, archived=True, reason="Game is over.")
 
-    # If the game is rated, perform the relatively intensive task of updating the DB rankings
-    if rated:
-        for player_id in player_ratings:  # Every rated player, post new ratings in the database
-            player_data = player_ratings[player_id]
-            update_player(game_type, InternalPlayer(mu=player_data["new_rating"],
-                                                    sigma=player_data["new_sigma"],
-                                                    user=discord.Object(id=player_id)))
-
-        update_db_rankings(game_type)  # Update ranking db variable
+    # # If the game is rated, perform the relatively intensive task of updating the DB rankings
+    # if rated:
+    #     for player_id in player_ratings:  # Every rated player, post new ratings in the database
+    #         player_data = player_ratings[player_id]
+    #         update_player(game_type, InternalPlayer(mu=player_data["new_mu"],
+    #                                                 sigma=player_data["new_sigma"],
+    #                                                 user=discord.Object(id=player_id)))
+    #
+    #     update_db_rankings(game_type)  # Update ranking db variable

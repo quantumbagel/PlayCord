@@ -1,9 +1,9 @@
 import discord
 
-VERSION = "dev13"
+VERSION = "dev14"
 IS_ACTIVE = True
 NAME = "PlayCord"
-RUNTIME_EMOJIS = None
+MANAGED_BY = "quantumbagel"
 LOGGING_ROOT = "playcord"
 SERVER_TIMEOUT = 5000
 
@@ -36,6 +36,7 @@ INFO_COLOR = discord.Color.from_str("#9A9CB0")
 CONFIG_BOT_SECRET = "secret"
 
 CONFIG_FILE = "configuration/config.yaml"
+EMOJI_CONFIGURATION_FILE = "configuration/emoji.yaml"
 
 ERROR_IMPORTED = "This file is NOT designed to be imported. Please run bot.py directly!"
 ERROR_NO_SYSTEM_CHANNEL = "No system channel is set - not sending anything."
@@ -67,6 +68,56 @@ TEXTIFY_CURRENT_GAME_TURN = {
 
 }
 
+# Textify options for game started messages
+TEXTIFY_GAME_STARTED = {
+    "The game has begun! Good luck, {players}!": 0.5,
+    "Let the games begin! {players}, may the best player win!": 0.3,
+    "Game on! {players} are ready to battle it out!": 0.15,
+    "Alright {players}, let's see what you've got!": 0.04,
+    "In a world where only one can win... {players} enter the arena.": 0.01,
+}
+
+# Textify options for join button text
+TEXTIFY_BUTTON_JOIN = {
+    "Join": 0.7,
+    "Join Game": 0.2,
+    "Count me in!": 0.08,
+    "I'm in!": 0.02,
+}
+
+# Textify options for leave button text
+TEXTIFY_BUTTON_LEAVE = {
+    "Leave": 0.7,
+    "Leave Game": 0.2,
+    "Nah, I'm out": 0.08,
+    "Goodbye!": 0.02,
+}
+
+# Textify options for start button text
+TEXTIFY_BUTTON_START = {
+    "Start": 0.7,
+    "Start Game": 0.2,
+    "Let's go!": 0.08,
+    "Begin!": 0.02,
+}
+
+# Textify options for game over messages
+TEXTIFY_GAME_OVER = {
+    "Game over! {winner} wins!": 0.4,
+    "And the winner is... {winner}!": 0.3,
+    "Congratulations to {winner} for the victory!": 0.2,
+    "{winner} has emerged victorious!": 0.08,
+    "Against all odds, {winner} has won! What a game!": 0.02,
+}
+
+# Textify options for draw messages
+TEXTIFY_GAME_DRAW = {
+    "It's a draw!": 0.5,
+    "The game ends in a tie!": 0.3,
+    "No winner this time - it's a draw!": 0.15,
+    "Both players are evenly matched! It's a tie!": 0.05,
+}
+
 SIGMA_RELATIVE_UNCERTAINTY_THRESHOLD = 0.20
 
 # Current ongoing games
@@ -84,5 +135,25 @@ AUTOCOMPLETE_CACHE = {}
 # - user_id
 # - - current: autocompletes
 
+DATABASE_GAME_IDS = {}
+
+# Cross-server matchmaking queue
+# Format: {game_type: {matchmaker_id: MatchmakingInterface}}
+GLOBAL_MATCHMAKING_QUEUE = {}
+
+# Whether to allow cross-server matchmaking (can be toggled)
+CROSS_SERVER_MATCHMAKING_ENABLED = False
 
 LONG_SPACE_EMBED = "\u2800"  # discord hides spaces when there is more than one in a row, this fixes it
+
+# Button custom_id prefixes
+BUTTON_PREFIX_JOIN = "join/"
+BUTTON_PREFIX_LEAVE = "leave/"
+BUTTON_PREFIX_START = "start/"
+BUTTON_PREFIX_SELECT_CURRENT = "select_c/"
+BUTTON_PREFIX_SELECT_NO_TURN = "select_n/"
+BUTTON_PREFIX_CURRENT_TURN = "c/"
+BUTTON_PREFIX_NO_TURN = "n/"
+BUTTON_PREFIX_INVITE = "invite/"
+BUTTON_PREFIX_SPECTATE = "spectate/"
+BUTTON_PREFIX_PEEK = "peek/"

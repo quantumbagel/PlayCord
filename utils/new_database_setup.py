@@ -1,13 +1,13 @@
 import mysql.connector
 
-from utils.database_new_version import (create_game, end_game, get_game_moves, get_game_participants,
-                                        get_or_create_gamemode,
-                                        get_rankings, get_server_id, get_server_metadata, get_total_matches_played,
-                                        get_user_gamemode_stats, get_user_id, get_user_last_games, get_user_metadata,
-                                        get_users_in_server, increment_total_matches_played, link_user_to_server,
-                                        update_server_metadata,
-                                        update_user_gamemode_stats,
-                                        update_user_metadata)  # Replace with actual filename
+from utils.database import (create_game, end_game, get_game_moves, get_game_participants,
+                            get_or_create_gamemode,
+                            get_rankings, get_server_id, get_server_metadata, get_total_matches_played,
+                            get_user_gamemode_stats, get_user_id, get_user_last_games, get_user_metadata,
+                            get_users_in_server, increment_total_matches_played, link_user_to_server,
+                            update_server_metadata,
+                            update_user_gamemode_stats,
+                            update_user_metadata)  # Replace with actual filename
 
 # Database setup
 db_config = {
@@ -23,7 +23,7 @@ def setup_database():
     conn = mysql.connector.connect(**db_config)
     cursor = conn.cursor()
 
-    # Drop existing tables
+    # # Drop existing tables
     cursor.execute("DROP TABLE IF EXISTS moves, games, gamemodes, servers, users")
 
     # Create tables

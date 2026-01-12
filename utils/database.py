@@ -1,60 +1,80 @@
+import json
 import logging
+from datetime import datetime
 
+import discord
 import mysql.connector
-import trueskill
 from mysql.connector import Error
-from mysql.connector.pooling import PooledMySQLConnection
 
-import configuration.constants
 from api.Player import Player
-from configuration.constants import *
-from configuration.constants import GAME_TRUESKILL, GAME_TYPES, LOGGING_ROOT, MU
+from configuration import constants
+from configuration.constants import GAME_TRUESKILL, MU, SIGMA_RELATIVE_UNCERTAINTY_THRESHOLD
 
-# Database logger
-logger = logging.getLogger(f"{LOGGING_ROOT}.database")
+logger = logging.getLogger("playcord.database")
 
-connections_made = 1  # Keep track of how many connections were made for logging purposes
+
+class InternalPlayerRatingStatistic:
+    def __init__(self, name, mu, sigma):
+        self.name = name
+        if mu is None:
+            self.mu = MU
+            self.sigma = GAME_TRUESKILL[name]["sigma"] * MU
+            self.stored = False
+        else:
+            self.mu = mu
+            self.sigma = sigma
+            self.stored = True
 
 
 class InternalPlayer:
-    def __init__(self, mu: float = None, sigma: float = None, user: discord.User | discord.Object = None,
-                 ranking: int = None,
-                 allow_passive_elo_gathering: str = None):
-        self.user = user
-        self.mu = mu
-        self.sigma = sigma
+    def __init__(self, ratings: dict[str, dict[str, float]], user: discord.User | discord.Object = None, metadata=None,
+                 id: int = None):
+        # Null checks
         if isinstance(user, discord.User):
             self.name = user.name
         else:
             self.name = None
-        self.id = user.id
+
+        if user is not None:
+            self.id = user.id
+        else:
+            self.id = id
+
+        if metadata is not None:
+            self.metadata = metadata
+        else:
+            self.metadata = {}
+
+        # No servers in new schema
+        self.servers = []
+
+        # Blind assignments
+        self.user = user
+        self.ratings = ratings
         self.player_data = {}
         self.moves_made = 0
-        self.ranking = ranking
-        self.allow_passive_elo_gathering = allow_passive_elo_gathering
+
+        self._update_ratings(self.ratings)
+
+    def _update_ratings(self, ratings):
+        for key in GAME_TRUESKILL:
+            if key not in ratings:
+                ratings[key] = {"mu": MU, "sigma": GAME_TRUESKILL[key]["sigma"] * MU}
+            setattr(self, key, InternalPlayerRatingStatistic(key,
+                                                             ratings[key]["mu"],
+                                                             ratings[key]["sigma"]))
 
     @property
     def mention(self):
-        return f"<@{self.id}>"  # Don't use the potential self.user.mention because it could be an Object
+        return f"<@{self.id}>"  # Don't use self.user.mention because it could be an Object
 
-    def move(self, new_player_data: dict):
-        self.moves_made += 1
-        self.player_data.update(new_player_data)
-
-    def get_formatted_elo(self):
-        if self.mu is None and self.allow_passive_elo_gathering:
-            update_elo_data = get_player(self.allow_passive_elo_gathering, self)
-            self.mu = update_elo_data.mu
-            self.sigma = update_elo_data.sigma
-            self.ranking = update_elo_data.ranking
-        if self.ranking is None:
-            ranking_addend = ""
-        else:
-            ranking_addend = f" (#{self.ranking})"
-        if self.sigma > SIGMA_RELATIVE_UNCERTAINTY_THRESHOLD * self.mu:  # TODO: this IS wrong
-            return str(int(self.mu)) + "?" + ranking_addend
-        else:
-            return str(int(self.mu)) + ranking_addend
+    def get_formatted_elo(self, game_type):
+        rating = getattr(self, game_type)
+        if rating.mu is None:  # No rating information
+            return "No Rating"
+        if rating.sigma > SIGMA_RELATIVE_UNCERTAINTY_THRESHOLD * rating.mu:
+            return str(round(rating.mu)) + "?"
+        return str(round(rating.mu))
 
     def __eq__(self, other):
         if other is None:
@@ -65,224 +85,388 @@ class InternalPlayer:
         return hash(self.id)
 
     def __str__(self):
-        return f"{self.id} ({self.name}) bot={self.user.bot}"
+        if self.user is not None:
+            return f"{self.id} ({self.name}) bot={self.user.bot} ratings={self.ratings}"
+        else:
+            return f"{self.id} ({self.name}) bot=no-user-provided, ratings={self.ratings}"
 
     def __repr__(self):
-        return f"InternalPlayer(id={self.id}, mu={self.mu}, sigma={self.sigma})"
+        if self.user is not None:
+            return f"InternalPlayer(id={self.id}, bot={self.user.bot}, ratings={self.ratings})"
+        else:
+            return f"InternalPlayer(id={self.id}, bot=no-user-provided, ratings={self.ratings})"
 
 
-def create_connection() -> PooledMySQLConnection | None:
-    """
-    Create a connection to the database.
-    :return: MySQL connection if success, None otherwise.
-    """
-    config = configuration.constants.CONFIGURATION  # Force a recopy of the configuration in case of changes.
-    global connections_made
-    log = logger.getChild("connect")
-    log.debug(f"Establishing connection #{connections_made} to database")
-    connections_made += 1  # Update connection attempt counter
-
-    # Attempt a connection
-    try:
-        connection = mysql.connector.connect(
-            host=config["db"]["domain"],  # Change if necessary
-            user=config["db"]["user"],
-            password=config["db"]["password"],
-            port=config["db"]["port"],
-        )
-        return connection
-    except Error as e:  # Something went wrong.
-        log.critical(f"Error connecting to database: {e}")
-        return None
+def get_shallow_player(user: discord.User) -> InternalPlayer:
+    return InternalPlayer(ratings={}, user=user)
 
 
-def startup() -> bool:
-    """
-    Ensure the required database tables exist on startup.
-    :return: True if success, False otherwise (database connection failure).
-    """
-    db = create_connection()  # Get the connection
-    if db is None:
-        return False  # Return False if failure to start up
-    cursor = db.cursor()
-    for game_type in GAME_TYPES.keys():
-        cursor.execute(f"CREATE DATABASE IF NOT EXISTS {game_type}")  # Make sure all databases exist
-        cursor.execute(f"USE {game_type}")
-
-        # Create the leaderboard table within the game's database
-        cursor.execute("""CREATE TABLE IF NOT EXISTS leaderboard (  
-                          id BIGINT UNSIGNED PRIMARY KEY,
-                          mu DECIMAL(10,4) NOT NULL,
-                          sigma DECIMAL(10,4) NOT NULL,
-                          ranking BIGINT UNSIGNED DEFAULT null,
-                          INDEX skill (mu DESC, sigma));
-                       """)
-
-    cursor.close()  # Close the connection
-    db.close()
-    return True
-
-
-def internal_player_to_player(internal_player: InternalPlayer) -> Player:
-    return Player(mu=internal_player.mu, sigma=internal_player.sigma, ranking=internal_player.ranking,
+def internal_player_to_player(internal_player: InternalPlayer, game_type: str) -> Player:
+    rating = getattr(internal_player, game_type)
+    return Player(mu=rating.mu, sigma=rating.sigma, ranking=None,
                   id=internal_player.user.id, name=internal_player.user.name)
 
 
-def get_player(game_type: str, user: discord.User | InternalPlayer) -> InternalPlayer | None:
-    """
-    Get a utils.Player object from the database.
-    :param game_type: The game_type the Player is playing
-    :param user: the discord.User or Player object to base the player off
-    :return: the Player.py or None if failed (database connection error)
-    """
-    db = create_connection()  # Get the connection
-    if db is None:
-        return None  # Return none if failure to connect
+class Database:
+    def __init__(self, host, user, password, database):
+        self.host = host
+        self.user = user
+        self.password = password
+        self.database = database
+        self.connection = None
+        self.connect()
 
-    cursor = db.cursor()
-    cursor.execute(f"USE {game_type}")  # Select database
-    cursor.execute(f"SELECT * FROM leaderboard WHERE id={user.id}")  # Get id entries
+    def connect(self):
+        try:
+            self.connection = mysql.connector.connect(
+                host=self.host,
+                user=self.user,
+                password=self.password,
+                database=self.database
+            )
+            logger.info("Connected to database.")
+        except Error as e:
+            logger.info(f"Error connecting to MySQL: {e}")
+            self.connection = None
 
-    results = cursor.fetchall()  # Get the results of the query
+    def _execute_query(self, query, params=None, fetchone=False, fetchall=False):
+        if not self.connection:
+            self.connect()
+            if not self.connection:
+                raise Exception("Failed to connect to database.")
 
-    if not len(results):  # Player is not in DB, return default values of mu and sigma
-        id, mu, sigma, ranking = user.id, MU, GAME_TRUESKILL[game_type]["sigma"] * MU, None
-    else:
-        id, mu, sigma, ranking = results[0]
-        # Database has info, return that
-        # Idk why, but we get a decimal.Decimal (infinite precision?), so convert to float
-        mu = float(mu)
-        sigma = float(sigma)
+        cursor = self.connection.cursor(dictionary=True)
+        try:
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
 
-    player = InternalPlayer(mu, sigma, user, ranking)  # Create player object from data
-    # Close connection
-    cursor.close()
-    db.close()
+            if fetchone:
+                return cursor.fetchone()
+            elif fetchall:
+                return cursor.fetchall()
+            else:
+                self.connection.commit()
+                return cursor.lastrowid if cursor.lastrowid else None
+        except Error as e:
+            logger.warning(
+                f"Error executing query {query} (params={params}, fetchone={fetchone}, fetchall={fetchall}): {e}")
+            raise
+        finally:
+            cursor.close()
 
-    return player  # Return the created object
+    def create_user(self, user_id):
+        query = "INSERT IGNORE INTO users (user_id) VALUES (%s);"
+        self._execute_query(query, (user_id,))
+
+    def create_guild(self, guild_id):
+        query = "INSERT IGNORE INTO guilds (guild_id) VALUES (%s);"
+        self._execute_query(query, (guild_id,))
+
+    def update_user_preferences(self, user_id, preferences):
+        preferences_json = json.dumps(preferences)
+        query = """
+                INSERT INTO users (user_id, preferences)
+                VALUES (%s, %s)
+                ON DUPLICATE KEY UPDATE preferences = VALUES(preferences);
+                """
+        self._execute_query(query, (user_id, preferences_json))
+
+    def get_user_preferences(self, user_id):
+        query = "SELECT joined_at, preferences FROM users WHERE user_id = %s;"
+        result = self._execute_query(query, (user_id,), fetchone=True)
+        if result and result['preferences']:
+            result['preferences'] = json.loads(result['preferences'])
+        return result
+
+    def update_guild_preferences(self, guild_id, preferences):
+        preferences_json = json.dumps(preferences)
+        query = """
+                INSERT INTO guilds (guild_id, preferences)
+                VALUES (%s, %s)
+                ON DUPLICATE KEY UPDATE preferences = VALUES(preferences);
+                """
+        self._execute_query(query, (guild_id, preferences_json))
+
+    def get_guild_preferences(self, guild_id):
+        query = "SELECT joined_at, preferences FROM guilds WHERE guild_id = %s;"
+        result = self._execute_query(query, (guild_id,), fetchone=True)
+        if result and result['preferences']:
+            result['preferences'] = json.loads(result['preferences'])
+        return result
+
+    def delete_user(self, user_id):
+        query = "DELETE FROM users WHERE user_id = %s;"
+        self._execute_query(query, (user_id,))
+
+    def initialize_user_game_ratings(self, user_id, guild_id, game_name):
+        self.create_user(user_id)
+        self.create_guild(guild_id)
+        mu = MU
+        sigma = GAME_TRUESKILL[game_name]["sigma"] * mu
+        query = "INSERT IGNORE INTO user_game_ratings (user_id, guild_id, game_name, mu, sigma) VALUES (%s, %s, %s, %s, %s);"
+        self._execute_query(query, (user_id, guild_id, game_name, mu, sigma))
+
+    def update_ratings_after_match(self, user_id, guild_id, game_name, mu, sigma,
+                                   matches_played_increment=1):
+        self.create_user(user_id)
+        self.create_guild(guild_id)
+        query = """
+                INSERT INTO user_game_ratings (user_id, guild_id, game_name, mu, sigma, matches_played, last_played)
+                VALUES (%s, %s, %s, 25.0 + %s, 8.333 + %s, %s, CURRENT_TIMESTAMP)
+                ON DUPLICATE KEY UPDATE mu             = %s,
+                                        sigma          = %s,
+                                        matches_played = matches_played + %s,
+                                        last_played    = CURRENT_TIMESTAMP;
+                """
+        self._execute_query(query,
+                            (user_id, guild_id, game_name, mu, sigma, matches_played_increment, mu,
+                             sigma,
+                             matches_played_increment))
+
+    def get_user_game_ratings(self, user_id, guild_id, game_name):
+        query = "SELECT mu, sigma, matches_played, last_played FROM user_game_ratings WHERE user_id = %s AND guild_id = %s AND game_name = %s;"
+        return self._execute_query(query, (user_id, guild_id, game_name), fetchone=True)
+
+    def get_game_leaderboard(self, guild_id, game_name, limit=10):
+        query = """
+                SELECT user_id, mu, sigma, conservative_rating AS rating, matches_played
+                FROM user_game_ratings
+                WHERE guild_id = %s
+                  AND game_name = %s
+                ORDER BY conservative_rating DESC
+                LIMIT %s;
+                """
+        return self._execute_query(query, (guild_id, game_name, limit), fetchall=True)
+
+    def reset_user_game_ratings(self, user_id, guild_id, game_name):
+        query = """
+                UPDATE user_game_ratings
+                SET mu             = 25.0,
+                    sigma          = 8.333,
+                    matches_played = 0,
+                    last_played    = NULL
+                WHERE user_id = %s
+                  AND guild_id = %s
+                  AND game_name = %s;
+                """
+        self._execute_query(query, (user_id, guild_id, game_name))
+
+    def delete_user_game_ratings(self, user_id, guild_id, game_name):
+        query = "DELETE FROM user_game_ratings WHERE user_id = %s AND guild_id = %s AND game_name = %s;"
+        self._execute_query(query, (user_id, guild_id, game_name))
+
+    def record_new_game(self, game_name, guild_id, started_at, is_rated, game_data):
+        self.create_guild(guild_id)
+        ended_at = datetime.now()
+        game_data_json = json.dumps(game_data)
+        query = """
+                INSERT INTO matches (game_name, guild_id, started, ended, rated, game_data)
+                VALUES (%s, %s, %s, %s, %s, %s);
+                """
+        params = (game_name, guild_id, started_at, ended_at, is_rated, game_data_json)
+        return self._execute_query(query, params)
+
+    def get_match_details(self, match_id):
+        query = "SELECT * FROM matches WHERE match_id = %s;"
+        result = self._execute_query(query, (match_id,), fetchone=True)
+        if result and result['game_data']:
+            result['game_data'] = json.loads(result['game_data'])
+        return result
+
+    def get_recent_matches_for_game(self, guild_id, game_name, limit=10):
+        query = """
+                SELECT match_id, started, ended, rated
+                FROM matches
+                WHERE guild_id = %s
+                  AND game_name = %s
+                ORDER BY ended DESC
+                LIMIT %s;
+                """
+        return self._execute_query(query, (guild_id, game_name, limit), fetchall=True)
+
+    def update_match_game_data(self, match_id, new_final_scores):
+        new_final_scores_json = json.dumps(new_final_scores)
+        query = """
+                UPDATE matches
+                SET game_data = JSON_SET(game_data, '$.final_scores', %s)
+                WHERE match_id = %s;
+                """
+        self._execute_query(query, (new_final_scores_json, match_id))
+
+    def delete_match(self, match_id):
+        query = "DELETE FROM matches WHERE match_id = %s;"
+        self._execute_query(query, (match_id,))
+
+    def add_match_participants(self, match_id, participants):
+        query = """
+                INSERT INTO match_participants (match_id, user_id, ranking, mu_delta, sigma_delta)
+                VALUES (%s, %s, %s, %s, %s);
+                """
+        for participant_key in participants:
+            p = participants[participant_key]
+            self.create_user(p['uid'])
+            self._execute_query(query, (match_id, p['uid'], p['ranking'], p['mu_delta'], p['sigma_delta']))
+
+    def get_match_participants(self, match_id):
+        query = """
+                SELECT user_id, ranking, mu_delta, sigma_delta
+                FROM match_participants
+                WHERE match_id = %s
+                ORDER BY ranking ASC;
+                """
+        return self._execute_query(query, (match_id,), fetchall=True)
+
+    def get_user_match_history(self, user_id, guild_id, limit=10):
+        query = """
+                SELECT m.match_id, m.game_name, m.ended, mp.ranking, mp.mu_delta, mp.sigma_delta
+                FROM match_participants mp
+                         JOIN matches m ON mp.match_id = m.match_id
+                WHERE mp.user_id = %s
+                  AND m.guild_id = %s
+                ORDER BY m.ended DESC
+                LIMIT %s;
+                """
+        return self._execute_query(query, (user_id, guild_id, limit), fetchall=True)
+
+    def get_inactive_users(self, guild_id=None):
+        query = """
+                SELECT guild_id, user_id, game_name, last_played
+                FROM user_game_ratings
+                WHERE last_played < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 30 DAY)
+                """
+        params = []
+        if guild_id is not None:
+            query += " AND guild_id = %s"
+            params.append(guild_id)
+        return self._execute_query(query, tuple(params) if params else None, fetchall=True)
+
+    def get_full_match_details(self, match_id):
+        query = """
+                SELECT m.*, mp.user_id, mp.ranking, mp.mu_delta, mp.sigma_delta, ugr.mu, ugr.sigma
+                FROM matches m
+                         JOIN match_participants mp ON m.match_id = mp.match_id
+                         LEFT JOIN user_game_ratings ugr
+                                   ON mp.user_id = ugr.user_id AND m.game_name = ugr.game_name AND
+                                      m.guild_id = ugr.guild_id
+                WHERE m.match_id = %s;
+                """
+        results = self._execute_query(query, (match_id,), fetchall=True)
+        for result in results:
+            if result['game_data']:
+                result['game_data'] = json.loads(result['game_data'])
+        return results
+
+    def count_matches_for_game(self, guild_id, game_name, is_rated=None):
+        query = """
+                SELECT COUNT(*) AS match_count
+                FROM matches
+                WHERE guild_id = %s
+                  AND game_name = %s
+                """
+        params = [guild_id, game_name]
+        if is_rated is not None:
+            query += " AND rated = %s"
+            params.append(is_rated)
+        query += ";"
+        result = self._execute_query(query, tuple(params), fetchone=True)
+        return result['match_count'] if result else 0
+
+    def count_matches_for_user(self, user_id, guild_id, is_rated=None):
+        query = """
+                SELECT COUNT(DISTINCT m.match_id) AS total_matches
+                FROM match_participants mp
+                         JOIN matches m ON mp.match_id = m.match_id
+                WHERE mp.user_id = %s
+                  AND m.guild_id = %s
+                """
+        params = [user_id, guild_id]
+        if is_rated is not None:
+            query += " AND m.rated = %s"
+            params.append(is_rated)
+        query += ";"
+        result = self._execute_query(query, tuple(params), fetchone=True)
+        return result['total_matches'] if result else 0
+
+    def get_player(self, user: discord.User | discord.Member, guild_id: int) -> InternalPlayer | None:
+        """
+        Get an InternalPlayer object from the database (per-guild ratings now).
+        """
+        user_id = user.id if isinstance(user, (discord.User, discord.Member, InternalPlayer)) else user
+        preferences = self.get_user_preferences(user_id)
+        metadata = preferences['preferences'] if preferences and preferences['preferences'] else {}
+
+        query = "SELECT game_name, mu, sigma FROM user_game_ratings WHERE user_id = %s AND guild_id = %s;"
+        ratings_data = self._execute_query(query, (user_id, guild_id), fetchall=True)
+        ratings = {row['game_name']: {'mu': row['mu'], 'sigma': row['sigma']} for row in
+                   ratings_data} if ratings_data else {}
+
+        ip = InternalPlayer(
+            ratings=ratings,
+            user=user if isinstance(user, (discord.User, discord.Member)) else None,
+            metadata=metadata,
+            id=user_id
+        )
+        return ip
+
+    def create_game(self, game_name: str, guild_id: int, participants: list,
+                    is_rated: bool = True) -> int:
+        self.create_guild(guild_id)
+        user_ids = [p.id if hasattr(p, 'id') else p for p in participants]
+        for user_id in user_ids:
+            self.create_user(user_id)
+            self.initialize_user_game_ratings(user_id, guild_id, game_name)
+
+        started_at = datetime.now()
+
+        match_id = self.record_new_game(
+            game_name=game_name,
+            guild_id=guild_id,
+            started_at=started_at,
+            is_rated=is_rated,
+            game_data={"status": "in_progress"}
+        )
+
+        return match_id
+
+    def end_game(self, match_id: int, game_name: str, final_scores: dict[int, float],
+                 rating_updates: dict):
+        match = self.get_match_details(match_id)
+        if not match:
+            raise ValueError(f"Match {match_id} not found.")
+        guild_id = match['guild_id']
+
+        self.update_match_game_data(match_id, final_scores)
+
+        self.add_match_participants(match_id, rating_updates)
+
+        for update_key, actual_update in rating_updates.items():
+            self.update_ratings_after_match(
+                user_id=actual_update["uid"],
+                guild_id=guild_id,
+                game_name=game_name,
+                mu=actual_update["new_mu"],
+                sigma=actual_update["new_sigma"],
+                matches_played_increment=1
+            )
 
 
-def get_shallow_player(game_type: str, user: discord.User) -> InternalPlayer:
-    return InternalPlayer(mu=None, sigma=None, user=user, ranking=None, allow_passive_elo_gathering=game_type)
+database: Database | None = None
 
 
-def delete_player(player: InternalPlayer) -> bool:
-    """
-    Delete a player from the database.
-    :param player: The Player.py object to delete from the database
-    :return: True if success, False otherwise (database connection failure).
-    """
-    db = create_connection()
-    if db is None:
-        return False  # Return false if failure to connect because the action failed
-
-    cursor = db.cursor()
-    for game_type in GAME_TYPES.keys():
-        cursor.execute(f"USE {game_type}")  # Select database
-        cursor.execute(f"DELETE FROM leaderboard WHERE id={player.id}")  # Delete entries by id
-
-    db.commit()  # Force the changes
-    # Close connection
-    cursor.close()
-    db.close()
-    return True
-
-
-def update_player(game_type: str, player: InternalPlayer) -> bool:
-    """
-    Update a player's mu/sigma values in the database.
-    :param game_type: the game_type the Player.py is playing
-    :param player: the Player.py object to use when updating the database
-    :return: True if success, False otherwise (database connection failure).
-    """
-    db = create_connection()
-    if db is None:
-        return False  # Return false if failure to connect, because the action failed
-
-    cursor = db.cursor()
-    cursor.execute(f"USE {game_type}")  # Select database
-    cursor.execute(f"INSERT INTO leaderboard (id, mu, sigma)"
-                   f"VALUES ({player.id}, {player.mu}, {player.sigma})"
-                   f"ON DUPLICATE KEY UPDATE mu = {player.mu}, sigma = {player.sigma};")  # update on id entries
-
-    # Close connection
-    db.commit()
-    cursor.close()
-    db.close()
-    return True
-
-
-def update_rankings(game_type: str, teams: list[list[InternalPlayer]]) -> bool:
-    """
-    Update the ELO of the players in the database after a rated match has finished.
-    :param teams: an ordered list of the rankings of the teams (TrueSkill format)
-    :param game_type: the game type being playing
-    :return: True if success, False otherwise (database connection failure).
-
-    TODO: finish, use ID from Player.py objects
-    """
-    game_type_data = GAME_TRUESKILL[game_type]  # TrueSkill environment constants for this game
-
-    # The variables for the specific game type
-    sigma, beta, tau, draw_probability = (game_type_data["sigma"],
-                                          game_type_data["beta"],
-                                          game_type_data["tau"],
-                                          game_type_data["draw"])
-
-    environment = trueskill.TrueSkill(MU, sigma, beta, tau, draw_probability)  # Create game environment
-
-    # Convert Player.py to TrueSkill.Rating
-    outcome = []
-    for team in teams:
-        team_ratings = []
-        for player in team:
-            team_ratings.append(environment.create_rating(player.mu, player.sigma))
-        outcome.append(team_ratings)
-
-    updated_rating_groups = environment.rate(outcome)  # Rerate the players based on outcome
-
-    # Update the Player.py objects and send that data to update_player to propagate to the DB
-    for team_index, team in enumerate(updated_rating_groups):
-        for player_index, player in enumerate(team):
-            teams[team_index][player_index].mu = player.mu
-            teams[team_index][player_index].sigma = player.sigma
-            update_player(game_type, teams[team_index][player_index].id, player.mu, player.sigma)
-
-
-def update_db_rankings(game_type):
-    """
-    Update the global ranking of the players in the database after a rated match has finished.
-    :param game_type: which game type to update rankings in
-    :return: True if success, False otherwise (database connection failure).
-    """
-    db = create_connection()
-    if db is None:
-        return False  # Return false if failure to connect, because the action failed
-
-    cursor = db.cursor()
-    cursor.execute(f"USE {game_type}")  # Select database
-
-    # Create temporary table with new ranking
-    cursor.execute("""CREATE TEMPORARY TABLE temp_leaderboard_ranking AS
-    SELECT id, FIND_IN_SET(mu, (
-        SELECT GROUP_CONCAT(sub.mu ORDER BY sub.mu DESC, sub.sigma)
-        FROM leaderboard AS sub
-    )) AS ranking
-    FROM leaderboard;
-    """)
-
-    # Update production table with temporary data
-    cursor.execute("""UPDATE leaderboard AS ldr
-    JOIN temp_leaderboard_ranking AS temp
-    ON ldr.id = temp.id
-    SET ldr.ranking = temp.ranking;
-    """)
-
-    # Drop temporary table
-    cursor.execute("DROP TEMPORARY TABLE temp_leaderboard_ranking;")
-
-    # Close connection
-    db.commit()
-    cursor.close()
-    db.close()
-    return True
+def startup():
+    global database
+    config_db = constants.CONFIGURATION["db"]
+    try:
+        db = Database(
+            host=config_db["host"],
+            user=config_db["user"],
+            password=config_db["password"],
+            database=config_db["database"]
+        )
+        database = db
+        return True
+    except mysql.connector.Error as err:
+        logger.error(f"Failed to connect to database: {err}")
+        return False
