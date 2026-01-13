@@ -13,6 +13,11 @@ from configuration.constants import GAME_TRUESKILL, MU, SIGMA_RELATIVE_UNCERTAIN
 logger = logging.getLogger("playcord.database")
 
 
+class DatabaseConnectionError(Exception):
+    """Exception raised when failed to connect to the database."""
+    pass
+
+
 class InternalPlayerRatingStatistic:
     def __init__(self, name, mu, sigma):
         self.name = name
@@ -108,8 +113,9 @@ def internal_player_to_player(internal_player: InternalPlayer, game_type: str) -
 
 
 class Database:
-    def __init__(self, host, user, password, database):
+    def __init__(self, host, port, user, password, database):
         self.host = host
+        self.port = port
         self.user = user
         self.password = password
         self.database = database
@@ -121,19 +127,22 @@ class Database:
             self.connection = mysql.connector.connect(
                 host=self.host,
                 user=self.user,
+                port=self.port,
                 password=self.password,
                 database=self.database
             )
             logger.info("Connected to database.")
         except Error as e:
-            logger.info(f"Error connecting to MySQL: {e}")
+            logger.error(f"Error connecting to MySQL: {e}")
             self.connection = None
+            raise DatabaseConnectionError(f"Could not connect to database: {e}")
 
     def _execute_query(self, query, params=None, fetchone=False, fetchall=False):
-        if not self.connection:
-            self.connect()
-            if not self.connection:
-                raise Exception("Failed to connect to database.")
+        if not self.connection or not self.connection.is_connected():
+            try:
+                self.connect()
+            except DatabaseConnectionError:
+                raise DatabaseConnectionError("Failed to connect to database.")
 
         cursor = self.connection.cursor(dictionary=True)
         try:
@@ -199,6 +208,10 @@ class Database:
     def delete_user(self, user_id):
         query = "DELETE FROM users WHERE user_id = %s;"
         self._execute_query(query, (user_id,))
+
+    def delete_guild(self, guild_id):
+        query = "DELETE FROM guilds WHERE guild_id = %s;"
+        self._execute_query(query, (guild_id,))
 
     def initialize_user_game_ratings(self, user_id, guild_id, game_name):
         self.create_user(user_id)
@@ -451,6 +464,20 @@ class Database:
                 matches_played_increment=1
             )
 
+    def record_analytics_event(self, event_type, user_id=None, guild_id=None, game_type=None, metadata=None):
+        if user_id:
+            self.create_user(user_id)
+        if guild_id:
+            self.create_guild(guild_id)
+
+        metadata_json = json.dumps(metadata) if metadata else None
+        query = """
+                INSERT INTO analytics (event_type, user_id, guild_id, game_type, metadata)
+                VALUES (%s, %s, %s, %s, %s);
+                """
+        params = (event_type, user_id, guild_id, game_type, metadata_json)
+        self._execute_query(query, params)
+
 
 database: Database | None = None
 
@@ -461,6 +488,7 @@ def startup():
     try:
         db = Database(
             host=config_db["host"],
+            port=config_db["port"],
             user=config_db["user"],
             password=config_db["password"],
             database=config_db["database"]

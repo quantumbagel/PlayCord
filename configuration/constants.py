@@ -157,3 +157,10 @@ BUTTON_PREFIX_NO_TURN = "n/"
 BUTTON_PREFIX_INVITE = "invite/"
 BUTTON_PREFIX_SPECTATE = "spectate/"
 BUTTON_PREFIX_PEEK = "peek/"
+
+PRESENCE_TIMEOUT = 60
+PRESENCE_PRESETS = [
+    f"with {NAME}!",
+    "games with friends!",
+    "/play catalog"
+]

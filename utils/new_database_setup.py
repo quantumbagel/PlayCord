@@ -1,14 +1,6 @@
 import mysql.connector
 
-from utils.database import (create_game, end_game, get_game_moves, get_game_participants,
-                            get_or_create_gamemode,
-                            get_rankings, get_server_id, get_server_metadata, get_total_matches_played,
-                            get_user_gamemode_stats, get_user_id, get_user_last_games, get_user_metadata,
-                            get_users_in_server, increment_total_matches_played, link_user_to_server,
-                            update_server_metadata,
-                            update_user_gamemode_stats,
-                            update_user_metadata)  # Replace with actual filename
-
+# TODO: FIX THIS CRAP
 # Database setup
 db_config = {
     'user': 'root',
@@ -28,48 +20,53 @@ def setup_database():
 
     # Create tables
     cursor.execute("""
-        CREATE TABLE users (
-            user_id VARCHAR(255) PRIMARY KEY,
-            ratings JSON,
-            metadata JSON,
-            servers JSON
-        )
-    """)
+                   CREATE TABLE users
+                   (
+                       user_id  VARCHAR(255) PRIMARY KEY,
+                       ratings  JSON,
+                       metadata JSON,
+                       servers  JSON
+                   )
+                   """)
     cursor.execute("""
-        CREATE TABLE servers (
-            server_id VARCHAR(255) PRIMARY KEY,
-            metadata JSON
-        )
-    """)
+                   CREATE TABLE servers
+                   (
+                       server_id VARCHAR(255) PRIMARY KEY,
+                       metadata  JSON
+                   )
+                   """)
     cursor.execute("""
-        CREATE TABLE gamemodes (
-            gamemode_id INT AUTO_INCREMENT PRIMARY KEY,
-            name VARCHAR(255) UNIQUE
-        )
-    """)
+                   CREATE TABLE gamemodes
+                   (
+                       gamemode_id INT AUTO_INCREMENT PRIMARY KEY,
+                       name        VARCHAR(255) UNIQUE
+                   )
+                   """)
     cursor.execute("""
-        CREATE TABLE games (
-            game_id VARCHAR(255) PRIMARY KEY,
-            gamemode_id INT,
-            version INT,
-            participants JSON,
-            result JSON,
-            start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            end_time TIMESTAMP NULL,
-            FOREIGN KEY (gamemode_id) REFERENCES gamemodes(gamemode_id)
-        )
-    """)
+                   CREATE TABLE games
+                   (
+                       game_id      VARCHAR(255) PRIMARY KEY,
+                       gamemode_id  INT,
+                       version      INT,
+                       participants JSON,
+                       result       JSON,
+                       start_time   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                       end_time     TIMESTAMP NULL,
+                       FOREIGN KEY (gamemode_id) REFERENCES gamemodes (gamemode_id)
+                   )
+                   """)
     cursor.execute("""
-        CREATE TABLE moves (
-            game_id VARCHAR(255),
-            user_id VARCHAR(255),
-            turn_number INT,
-            version INT,
-            metadata JSON,
-            PRIMARY KEY (game_id, turn_number, version),
-            FOREIGN KEY (game_id) REFERENCES games(game_id)
-        )
-    """)
+                   CREATE TABLE moves
+                   (
+                       game_id     VARCHAR(255),
+                       user_id     VARCHAR(255),
+                       turn_number INT,
+                       version     INT,
+                       metadata    JSON,
+                       PRIMARY KEY (game_id, turn_number, version),
+                       FOREIGN KEY (game_id) REFERENCES games (game_id)
+                   )
+                   """)
     conn.commit()
     conn.close()
 

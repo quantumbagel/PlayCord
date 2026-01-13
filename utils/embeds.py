@@ -82,6 +82,19 @@ class GameOverviewEmbed(CustomEmbed):
 
 class GameOverEmbed(CustomEmbed):
 
-    def __init__(self, rankings):  # TODO: add game_name and other customization
-        super().__init__(title="Game over!", description=f"Thanks so much for playing this game :)")
+    def __init__(self, rankings, game_name):
+        super().__init__(title=f"{game_name} game over!",
+                         description=f"Thanks so much for playing! Here are the rankings:")
         self.add_field(name="Rankings:", value=rankings, inline=True)
+
+
+class InviteEmbed(CustomEmbed):
+    def __init__(self, inviter, game_type, guild_name):
+        super().__init__(
+            title=f"👋 You've been invited!",
+            description=f"{inviter.mention} has invited you to play a game of **{game_type}** in **{guild_name}**.",
+            color=EMBED_COLOR
+        )
+        self.add_field(name="How to join?", value="Click the 'Join Game' button below to join the lobby.", inline=False)
+        self.add_field(name="Note:", value="If you don't want to play, you can simply ignore this message.",
+                       inline=False)

@@ -1127,7 +1127,7 @@ async def game_over(interface: GameInterface, outcome: str | InternalPlayer | li
     CURRENT_GAMES.pop(thread.id)  # Remove this game from the CURRENT_GAMES tracker
 
     # Create GameOverEmbed to show in the status and info messages
-    game_over_embed = GameOverEmbed(rankings=player_string)
+    game_over_embed = GameOverEmbed(rankings=player_string, game_name=interface.game.name)
 
     # Send the embed to overview / game thread
     await thread.send(embed=game_over_embed)

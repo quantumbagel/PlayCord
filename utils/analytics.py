@@ -8,6 +8,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
+from utils.database import database as db
+
 logger = logging.getLogger("playcord.analytics")
 
 
@@ -77,9 +79,23 @@ def flush_events() -> int:
 
     count = len(_event_buffer)
 
-    # TODO: Write to database when analytics table is added
-    # For now, just log and clear
-    logger.info(f"Flushing {count} analytics events")
+    if db:
+        try:
+            for event in _event_buffer:
+                db.record_analytics_event(
+                    event_type=event["event_type"],
+                    user_id=event["user_id"],
+                    guild_id=event["guild_id"],
+                    game_type=event["game_type"],
+                    metadata=event["metadata"]
+                )
+            logger.info(f"Flushed {count} analytics events to database.")
+        except Exception as e:
+            logger.error(f"Failed to flush analytics events to database: {e}")
+            # we keep the buffer so we can try again next time?
+            # for now let's just clear it to avoid memory leaks if DB is down permanently
+    else:
+        logger.warning("Database not connected, cannot flush analytics events.")
 
     _event_buffer = []
     return count
