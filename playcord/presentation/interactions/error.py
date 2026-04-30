@@ -16,13 +16,9 @@ from playcord.application.runtime_context import try_get_container
 from playcord.application.services.match_interrupt import interrupt_match
 from playcord.core.errors import DomainError
 from playcord.infrastructure.constants import (
-    BUTTON_PREFIX_CURRENT_TURN,
     BUTTON_PREFIX_GAME_MOVE,
     BUTTON_PREFIX_GAME_SELECT,
-    BUTTON_PREFIX_NO_TURN,
     BUTTON_PREFIX_PEEK,
-    BUTTON_PREFIX_SELECT_CURRENT,
-    BUTTON_PREFIX_SELECT_NO_TURN,
     BUTTON_PREFIX_SPECTATE,
     EPHEMERAL_DELETE_AFTER,
 )
@@ -91,10 +87,6 @@ _CUSTOM_ID_GAME_PREFIXES = (
     BUTTON_PREFIX_GAME_MOVE,
     BUTTON_PREFIX_GAME_SELECT,
     "game:",
-    BUTTON_PREFIX_SELECT_CURRENT,
-    BUTTON_PREFIX_SELECT_NO_TURN,
-    BUTTON_PREFIX_CURRENT_TURN,
-    BUTTON_PREFIX_NO_TURN,
     BUTTON_PREFIX_SPECTATE,
     BUTTON_PREFIX_PEEK,
 )

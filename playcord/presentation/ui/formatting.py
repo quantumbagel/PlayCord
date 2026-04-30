@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import random
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 from playcord.infrastructure.constants import LOGGING_ROOT, LONG_SPACE_EMBED
@@ -24,18 +25,24 @@ def discord_user_mention(user_id: int | None) -> str:
     return f"<@{user_id}>"
 
 
+def player_display_label(user: Any) -> str:
+    """Discord mention for humans; bot name and difficulty for AI players."""
+    if getattr(user, "is_bot", False):
+        base = getattr(user, "display_name", None) or getattr(user, "name", None) or "Bot"
+        diff = getattr(user, "bot_difficulty", None)
+        if diff:
+            return f"{base} ({diff})"
+        return str(base)
+    return discord_user_mention(getattr(user, "id", None))
+
+
 def column_names(players: list[InternalPlayer] | set[InternalPlayer]) -> str:
     """Convert a list of players into a string representing the list of players.
 
     @player
     @player2
     """
-    rendered_names = []
-    for user in players:
-        if getattr(user, "is_bot", False):
-            rendered_names.append(getattr(user, "name", "Bot"))
-        else:
-            rendered_names.append(discord_user_mention(getattr(user, "id", None)))
+    rendered_names = [player_display_label(user) for user in players]
     return "\n".join(rendered_names)
 
 
@@ -78,18 +85,27 @@ def column_creator(
     )
 
 
+def _turn_marker_ids(turn: Any | None) -> set[int]:
+    """Normalize a single player or an iterable of players into id flags."""
+    if turn is None:
+        return set()
+    if isinstance(turn, (tuple, list, frozenset, set)):
+        return {int(getattr(p, "id")) for p in turn}
+    return {int(getattr(turn, "id"))}
+
+
 def column_turn(
     players: list[InternalPlayer] | set[InternalPlayer],
-    turn: InternalPlayer | User,
+    turn: InternalPlayer | User | None | Iterable[InternalPlayer | User] = None,
 ) -> str:
-    """Convert a list of players into a string representing the list of players and whose turn it is.
+    """Mark players whose turn (or eligible turn) it is: one or many.
 
-    ✅
-    <blank>
+    ``turn`` may be a single player, a sequence of eligible players, or None.
     """
+    eligible_ids = _turn_marker_ids(turn)
     return "\n".join(
         [
-            "✅" if ((turn is not None) and (u.id == turn.id)) else LONG_SPACE_EMBED
+            "✅" if int(getattr(u, "id")) in eligible_ids else LONG_SPACE_EMBED
             for u in players
         ],
     )

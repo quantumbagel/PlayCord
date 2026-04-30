@@ -164,6 +164,15 @@ class MatchRepository:
         query = f"UPDATE matches SET {', '.join(updates)} WHERE match_id = %s;"
         self.database.execute_query(query, tuple(params))
 
+    def ensure_unique_match_code(self) -> str:
+        """Reserve an unused public match code (may race with concurrent inserts)."""
+        for _ in range(48):
+            code = generate_match_code()
+            if self.get_match_by_code(code) is None:
+                return code
+        msg = "Could not allocate a unique match_code"
+        raise RuntimeError(msg)
+
     def create_match(
         self,
         game_id: int,
@@ -173,6 +182,9 @@ class MatchRepository:
         participants: list[int],
         is_rated: bool = True,
         game_config: dict[str, Any] | None = None,
+        *,
+        match_id: int,
+        preset_match_code: str | None = None,
     ) -> tuple[int, str]:
         self.guilds.create_guild(guild_id)
         for user_id in participants:
@@ -181,18 +193,23 @@ class MatchRepository:
 
         config_json = json.dumps(game_config or {})
         last_err: Exception | None = None
-        for _ in range(48):
-            match_code = generate_match_code()
+        for attempt in range(48):
+            match_code = (
+                preset_match_code
+                if attempt == 0 and preset_match_code is not None
+                else generate_match_code()
+            )
             try:
                 with self.database.transaction() as cur:
                     cur.execute(
                         """
-                        INSERT INTO matches (game_id, guild_id, channel_id, thread_id,
+                        INSERT INTO matches (match_id, game_id, guild_id, channel_id, thread_id,
                             is_rated, game_config, status, match_code)
-                        VALUES (%s, %s, %s, %s, %s, %s::jsonb, 'in_progress', %s)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, 'in_progress', %s)
                         RETURNING match_id;
                         """,
                         (
+                            match_id,
                             game_id,
                             guild_id,
                             channel_id,
@@ -203,7 +220,7 @@ class MatchRepository:
                         ),
                     )
                     result = cur.fetchone()
-                    match_id = result["match_id"]
+                    resolved_match_id = result["match_id"]
 
                     for idx, user_id in enumerate(participants, start=1):
                         cur.execute(
@@ -225,9 +242,9 @@ class MatchRepository:
                                 (match_id, user_id, player_number, mu_before, sigma_before)
                             VALUES (%s, %s, %s, %s, %s);
                             """,
-                            (match_id, user_id, idx, mu_before, sigma_before),
+                            (resolved_match_id, user_id, idx, mu_before, sigma_before),
                         )
-                return match_id, match_code
+                return resolved_match_id, match_code
             except Exception as e:
                 if pg_errors and isinstance(
                     e,
@@ -707,6 +724,10 @@ class MatchRepository:
         started_at: Any,
         is_rated: bool,
         game_data: dict[str, Any],
+        *,
+        match_id: int,
+        channel_id: int = 0,
+        thread_id: int | None = None,
     ) -> tuple[int, str]:
         game = self.games.get_game(game_name)
         if not game:
@@ -728,16 +749,17 @@ class MatchRepository:
                         cur.execute(
                             """
                             INSERT INTO matches
-                                (game_id, guild_id, channel_id, thread_id, started_at, status, is_rated,
+                                (match_id, game_id, guild_id, channel_id, thread_id, started_at, status, is_rated,
                                  game_config, metadata, match_code)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)
                             RETURNING match_id;
                             """,
                             (
+                                match_id,
                                 game.game_id,
                                 guild_id,
-                                0,
-                                None,
+                                channel_id,
+                                thread_id,
                                 started_at,
                                 status,
                                 is_rated,
@@ -769,6 +791,9 @@ class MatchRepository:
         channel_id: int | None = None,
         thread_id: int | None = None,
         game_config: dict[str, Any] | None = None,
+        *,
+        match_id: int,
+        preset_match_code: str | None = None,
     ) -> tuple[int, str]:
         game = self.games.get_game(game_name)
         if not game:
@@ -783,6 +808,8 @@ class MatchRepository:
             participants=participants,
             is_rated=is_rated,
             game_config=game_config or {},
+            match_id=match_id,
+            preset_match_code=preset_match_code,
         )
 
     def end_game(

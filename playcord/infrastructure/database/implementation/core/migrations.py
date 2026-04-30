@@ -49,6 +49,19 @@ MIGRATIONS: list[tuple[str, str, list[str]]] = [
         ),
         [_load_migration_sql("migration_3_0_2.sql")],
     ),
+    (
+        "3.0.3",
+        "Add support for plugin-owned role assignments.",
+        [_load_migration_sql("migration_3_0_3.sql")],
+    ),
+    (
+        "3.0.4",
+        (
+            "Require application-assigned match_id (Discord thread snowflake);"
+            " drop identity column and legacy sequence."
+        ),
+        [_load_migration_sql("migration_3_0_4.sql")],
+    ),
 ]
 
 
@@ -144,11 +157,11 @@ class MigrationRunner:
         apply_migrations(database)
 
     def run_startup(
-        self,
-        database: Database,
-        games: object,
-        analytics: object,
-        matches: object,
+            self,
+            database: Database,
+            games: object,
+            analytics: object,
+            matches: object,
     ) -> None:
         """After migrations: refresh SQL assets, sync game registry, analytics cleanup,
         and mark stale in-progress matches interrupted.

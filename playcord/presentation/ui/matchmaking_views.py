@@ -32,6 +32,7 @@ class MatchmakingLobbyView(discord.ui.LayoutView):
         current_values: dict[str, str | int] | None = None,
         role_specs: list[tuple[int, str, tuple[str, ...]]] | None = None,
         current_role_values: dict[int, str] | None = None,
+        assign_roles_button_id: str | None = None,
         summary_text: str | None = None,
         table_image_url: str | None = None,
     ) -> None:
@@ -79,6 +80,15 @@ class MatchmakingLobbyView(discord.ui.LayoutView):
             )
             ready_btn.callback = self._route_to_cog
             action_row.add_item(ready_btn)
+
+        if assign_roles_button_id is not None:
+            assign_btn = discord.ui.Button(
+                label=get("buttons.assign_roles", default="Assign Roles"),
+                style=discord.ButtonStyle.primary,
+                custom_id=assign_roles_button_id,
+            )
+            assign_btn.callback = self._route_to_cog
+            action_row.add_item(assign_btn)
 
         container.add_item(action_row)
 

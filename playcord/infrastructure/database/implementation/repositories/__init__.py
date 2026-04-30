@@ -25,6 +25,9 @@ from playcord.infrastructure.database.implementation.repositories.move import (
 from playcord.infrastructure.database.implementation.repositories.rating import (
     RatingRepository,
 )
+from playcord.infrastructure.database.implementation.repositories.roles import (
+    RoleRepository,
+)
 from playcord.infrastructure.database.implementation.repositories.user import (
     PlayerRepository,
 )
@@ -40,4 +43,5 @@ __all__ = [
     "PlayerRepository",
     "RatingRepository",
     "ReplayRepository",
+    "RoleRepository",
 ]

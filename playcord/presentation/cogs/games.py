@@ -14,10 +14,8 @@ from playcord.application.runtime_context import get_container
 from playcord.application.services import replay_viewer
 from playcord.core.errors import ConfigurationError
 from playcord.infrastructure.constants import (
-    BUTTON_PREFIX_CURRENT_TURN,
     BUTTON_PREFIX_GAME_MOVE,
     BUTTON_PREFIX_GAME_SELECT,
-    BUTTON_PREFIX_NO_TURN,
     BUTTON_PREFIX_PAGINATION_FIRST,
     BUTTON_PREFIX_PAGINATION_LAST,
     BUTTON_PREFIX_PAGINATION_NEXT,
@@ -25,11 +23,8 @@ from playcord.infrastructure.constants import (
     BUTTON_PREFIX_PEEK,
     BUTTON_PREFIX_REMATCH,
     BUTTON_PREFIX_REPLAY_NAV,
-    BUTTON_PREFIX_SELECT_CURRENT,
-    BUTTON_PREFIX_SELECT_NO_TURN,
     BUTTON_PREFIX_SPECTATE,
     EPHEMERAL_DELETE_AFTER,
-    PERMISSION_MSG_NOT_PARTICIPANT,
 )
 from playcord.infrastructure.db_thread import run_in_thread
 from playcord.infrastructure.locale import fmt, get
@@ -197,14 +192,6 @@ class GamesCog(commands.Cog):
                     resource_id=resource_id,
                     payload=payload,
                 )
-            elif custom_id.startswith(BUTTON_PREFIX_SELECT_CURRENT):
-                await self.game_select_callback(ctx, current_turn_required=True)
-            elif custom_id.startswith(BUTTON_PREFIX_SELECT_NO_TURN):
-                await self.game_select_callback(ctx, current_turn_required=False)
-            elif custom_id.startswith(BUTTON_PREFIX_CURRENT_TURN):
-                await self.game_button_callback(ctx, current_turn_required=True)
-            elif custom_id.startswith(BUTTON_PREFIX_NO_TURN):
-                await self.game_button_callback(ctx, current_turn_required=False)
             elif custom_id.startswith(BUTTON_PREFIX_SPECTATE):
                 await self.spectate_callback(ctx)
             elif custom_id.startswith(BUTTON_PREFIX_PEEK):
@@ -350,14 +337,10 @@ class GamesCog(commands.Cog):
         if runtime is None:
             await _send_game_ended_error(ctx)
             return
-        name, arguments, current_turn_required = runtime.decode_component_payload(
-            payload,
-        )
-        await runtime.move_by_button(
+        await runtime.submit_component_input(
             ctx,
-            name=name,
-            arguments=arguments,
-            current_turn_required=current_turn_required,
+            payload=payload,
+            source="button",
         )
 
     async def _route_runtime_select(
@@ -371,156 +354,10 @@ class GamesCog(commands.Cog):
         if runtime is None:
             await _send_game_ended_error(ctx)
             return
-        name, _arguments, current_turn_required = runtime.decode_component_payload(
-            payload,
-        )
-        await runtime.move_by_select(
+        await runtime.submit_component_input(
             ctx,
-            name=name,
-            current_turn_required=current_turn_required,
-        )
-
-    async def game_button_callback(
-        self,
-        ctx: discord.Interaction,
-        current_turn_required: bool = True,
-    ) -> None:
-        await ctx.response.defer()
-        f_log = log.getChild("interaction.game_button")
-        f_log.debug(
-            "game_button_callback called by user=%s custom_id=%r",
-            getattr(ctx.user, "id", None),
-            ctx.data.get("custom_id"),
-        )
-        leading_str = (
-            BUTTON_PREFIX_CURRENT_TURN
-            if current_turn_required
-            else BUTTON_PREFIX_NO_TURN
-        )
-        try:
-            raw = ctx.data["custom_id"].replace(leading_str, "")
-            data = raw.split("/")
-            game_id = int(data[0])
-            function_id = data[1]
-            arg_blob = data[2] if len(data) > 2 else ""
-            arguments = (
-                {
-                    arg.split("=")[0]: arg.split("=")[1]
-                    for arg in arg_blob.split(",")
-                    if "=" in arg
-                }
-                if arg_blob
-                else {}
-            )
-        except (KeyError, IndexError, ValueError):
-            f_log.warning(
-                "Malformed game button custom_id for user=%s: %r",
-                getattr(ctx.user, "id", None),
-                ctx.data.get("custom_id"),
-            )
-            await _send_game_ended_error(ctx)
-            return
-
-        if game_id not in self._active_games:
-            f_log.info(
-                "Button referenced non-active game_id=%s from user=%s",
-                game_id,
-                getattr(ctx.user, "id", None),
-            )
-            await _send_game_ended_error(ctx)
-            return
-
-        game = self._active_games[game_id]
-
-        # Validate user is a participant in this game
-        participant_ids = {p.id for p in game.players}
-        if ctx.user.id not in participant_ids:
-            f_log.warning(
-                "User %s attempted game action but is not participant in game_id=%s",
-                ctx.user.id,
-                game_id,
-            )
-            await followup_send(
-                ctx,
-                PERMISSION_MSG_NOT_PARTICIPANT,
-                ephemeral=True,
-                delete_after=EPHEMERAL_DELETE_AFTER,
-            )
-            return
-
-        f_log.info(
-            "Invoking move_by_button for game_id=%s user=%s func=%s "
-            "args=%s current_turn_required=%s",
-            game_id,
-            ctx.user.id,
-            function_id,
-            arguments,
-            current_turn_required,
-        )
-        await game.move_by_button(
-            ctx=ctx,
-            name=function_id,
-            arguments=arguments,
-            current_turn_required=current_turn_required,
-        )
-
-    async def game_select_callback(
-        self,
-        ctx: discord.Interaction,
-        current_turn_required: bool = True,
-    ) -> None:
-        await ctx.response.defer()
-        f_log = log.getChild("interaction.game_select")
-        f_log.debug(
-            "game_select_callback called by user=%s custom_id=%r",
-            getattr(ctx.user, "id", None),
-            ctx.data.get("custom_id"),
-        )
-        leading_str = (
-            BUTTON_PREFIX_SELECT_CURRENT
-            if current_turn_required
-            else BUTTON_PREFIX_SELECT_NO_TURN
-        )
-        try:
-            raw = ctx.data["custom_id"].replace(leading_str, "")
-            data = raw.split("/")
-            game_id = int(data[0])
-            function_id = data[1]
-        except (KeyError, IndexError, ValueError):
-            f_log.warning(
-                "Malformed game select custom_id from user=%s: %r",
-                getattr(ctx.user, "id", None),
-                ctx.data.get("custom_id"),
-            )
-            await _send_game_ended_error(ctx)
-            return
-
-        if game_id not in self._active_games:
-            await _send_game_ended_error(ctx)
-            return
-
-        game = self._active_games[game_id]
-
-        # Validate user is a participant in this game
-        participant_ids = {p.id for p in game.players}
-        if ctx.user.id not in participant_ids:
-            f_log.warning(
-                "User %s attempted selection but is not participant in game_id=%s",
-                ctx.user.id,
-                game_id,
-            )
-            await followup_send(
-                ctx,
-                PERMISSION_MSG_NOT_PARTICIPANT,
-                ephemeral=True,
-                delete_after=EPHEMERAL_DELETE_AFTER,
-            )
-            return
-
-        await game.move_by_select(
-            ctx=ctx,
-            name=function_id,
-            current_turn_required=current_turn_required,
+            payload=payload,
+            source="select",
         )
 
     async def spectate_callback(self, ctx: discord.Interaction) -> None:
@@ -885,17 +722,15 @@ async def handle_move(
     ctx: discord.Interaction,
     name,
     arguments,
-    current_turn_required: bool = True,
 ) -> None:
     from playcord.infrastructure.analytics_client import EventType, register_event
 
     f_log = log.getChild("command.move")
     f_log.debug(
-        "handle_move called by user=%s name=%r args=%r current_turn_required=%s",
+        "handle_move called by user=%s name=%r args=%r",
         getattr(ctx.user, "id", None),
         name,
         arguments,
-        current_turn_required,
     )
 
     requested_group = getattr(
@@ -920,7 +755,6 @@ async def handle_move(
                 "reason": reason,
                 "move_name": name,
                 "command_group": requested_group,
-                "current_turn_required": bool(current_turn_required),
                 "source": "handle_move",
             },
         )
@@ -974,17 +808,16 @@ async def handle_move(
     arguments = {a: await decode_discord_arguments(work_args[a]) for a in work_args}
     reg.autocomplete_cache[ctx.channel.id] = {}
     f_log.info(
-        "Dispatching move_by_command for user=%s game_id=%s name=%r args=%r",
+        "Dispatching command input for user=%s game_id=%s name=%r args=%r",
         getattr(ctx.user, "id", None),
         ctx.channel.id,
         name,
         arguments,
     )
-    await active_game.move_by_command(
+    await active_game.submit_command_input(
         ctx,
-        name,
-        arguments,
-        current_turn_required=current_turn_required,
+        command_name=name,
+        arguments=arguments,
     )
 
 
@@ -1001,7 +834,7 @@ async def handle_autocomplete(
         return [
             app_commands.Choice(name=get("autocomplete.no_game_in_channel"), value=""),
         ]
-    if runtime.plugin.outcome() is not None:
+    if getattr(runtime, "ending_game", False):
         return [app_commands.Choice(name=get("autocomplete.game_finished"), value="-")]
     player = await run_in_thread(
         get_container().players_repository.get_player,

@@ -262,6 +262,30 @@ description = "Change settings for your current game lobby"
 param_rated = "Whether the game should be rated"
 param_private = "Whether the game should be private"
 
+[commands.bot]
+description = "Manage bots in your lobby"
+not_in_lobby = "You need to be in a game lobby to use this command. Start a new game with {command:play} or join an existing lobby first."
+only_creator = "Only the lobby creator can manage bots."
+available_difficulties = "Available Difficulties"
+queued_bots = "Queued Bots"
+no_queued_bots = "No bots currently queued"
+added = "Added bot with difficulty `{difficulty}`"
+added_multiple = "Added {count} bot(s) with difficulty `{difficulty}`"
+removed = "Removed bot `{name}`"
+
+[commands.bot.list]
+description = "Show available bot difficulties and queued bots"
+
+[commands.bot.add]
+description = "Add one or more bots to your lobby"
+param_difficulty = "The difficulty level of the bot to add"
+param_number = "How many bots of this difficulty to add (default: 1)"
+error_invalid_number = "The number of bots must be at least 1"
+
+[commands.bot.remove]
+description = "Remove a bot from your lobby"
+param_name = "The name of the bot to remove"
+
 [commands.group]
 description = "Everything that isn't a game."
 
@@ -848,6 +872,7 @@ bot_already_added = "A bot with difficulty '{difficulty}' is already in this lob
 bot_not_supported = "This game does not support bots."
 bot_invalid_difficulty = "Invalid bot difficulty '{difficulty}'."
 bot_too_many_for_game = "Cannot add bot: this game does not allow that many players."
+bot_not_found = "No bot named '{name}' found in this lobby."
 bot_display_rating = "Bot"
 field_match_options = "Match options"
 field_ready_state = "Ready check"
@@ -980,3 +1005,6 @@ not_in_game = "You're not a participant in this game."
 not_active = "There isn't an active game in this thread."
 wrong_channel = "Use {command:playcord forfeit} inside your active private game thread."
 summary = "Forfeited"
+
+[timeout]
+warning = "⏱️ Input timeout for {players} ({timestamp}). They have been removed from the game."

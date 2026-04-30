@@ -96,7 +96,7 @@ class EventsCog(commands.Cog):
         startup_logger.info("Client connected and ready.")
         self._presence_task = self.bot.loop.create_task(self.presence())
         self._analytics_task = self.bot.loop.create_task(
-            self._analytics_periodic_flush()
+            self._analytics_periodic_flush(),
         )
 
     async def _analytics_periodic_flush(self) -> None:

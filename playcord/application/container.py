@@ -22,6 +22,7 @@ from playcord.infrastructure.database import (
     PoolManager,
     RatingRepository,
     ReplayRepository,
+    RoleRepository,
 )
 from playcord.infrastructure.database.implementation.core.migrations import (
     apply_migrations,
@@ -53,6 +54,7 @@ class ApplicationContainer:
     ratings_repository: RatingRepository = field(init=False, repr=False, compare=False)
     replays_repository: ReplayRepository = field(init=False, repr=False, compare=False)
     guilds_repository: GuildRepository = field(init=False, repr=False, compare=False)
+    roles_repository: RoleRepository = field(init=False, repr=False, compare=False)
     analytics_repository: AnalyticsRepository = field(
         init=False,
         repr=False,
@@ -104,6 +106,7 @@ class ApplicationContainer:
             self.ratings_repository,
         )
         self.replays_repository = ReplayRepository(database)
+        self.roles_repository = RoleRepository(database)
 
         self.migration_runner.run_startup(
             database,

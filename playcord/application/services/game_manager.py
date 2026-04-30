@@ -1,30 +1,37 @@
-"""New modular game runtime."""
+"""Main-driven game runtime."""
 
 from __future__ import annotations
 
 import asyncio
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlencode
+from uuid import uuid4
 
 import discord
 
 from playcord.api import (
+    AutoForfeit,
     BinaryAsset,
-    ButtonSpec,
+    ButtonInput,
+    CommandInput,
     DeleteMessage,
     GameContext,
-    HandlerRef,
-    HandlerSpec,
+    GameInput,
+    GameInputSpec,
+    InputMode,
+    InputSource,
+    InputTimeout,
     MessageLayout,
-    Move,
-    MoveRequest,
+    MessagePurpose,
+    MessageTarget,
     OwnedMessage,
     RuntimeGame,
-    SelectSpec,
+    SelectInput,
     UpsertMessage,
 )
+from playcord.api.handlers import HandlerRef, HandlerSpec
 from playcord.application.runtime_context import get_container
 from playcord.application.services import replay_viewer
 from playcord.core.errors import ConfigurationError
@@ -33,6 +40,7 @@ from playcord.infrastructure.constants import (
     BUTTON_PREFIX_GAME_SELECT,
     BUTTON_PREFIX_PEEK,
     BUTTON_PREFIX_SPECTATE,
+    EPHEMERAL_DELETE_AFTER,
 )
 from playcord.infrastructure.db_thread import run_in_thread
 from playcord.infrastructure.locale import get
@@ -41,15 +49,39 @@ from playcord.presentation.interactions.helpers import followup_send
 from playcord.presentation.ui.containers import chunk_text_display_lines
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
 log = get_logger("game.runtime")
 
 
 @dataclass(slots=True)
-class RuntimeMoveResult:
-    actions: tuple[Any, ...]
-    finished: bool = False
+class PendingInputRequest:
+    request_id: str
+    players: tuple[Any, ...]
+    inputs: tuple[GameInputSpec, ...]
+    mode: InputMode
+    min_responses: int
+    future: asyncio.Future[Any]
+    responses: dict[int, GameInput] = field(default_factory=dict)
+    bot_tasks: list[asyncio.Task[Any]] = field(default_factory=list)
+
+    @property
+    def player_ids(self) -> set[int]:
+        return {int(player.id) for player in self.players}
+
+    @property
+    def input_by_id(self) -> dict[str, GameInputSpec]:
+        return {spec.id: spec for spec in self.inputs}
+
+    @property
+    def command_inputs(self) -> tuple[CommandInput, ...]:
+        return tuple(spec for spec in self.inputs if isinstance(spec, CommandInput))
+
+    def missing_players(self) -> tuple[Any, ...]:
+        responded = set(self.responses)
+        return tuple(
+            player for player in self.players if int(player.id) not in responded
+        )
 
 
 def _resolve_callback(
@@ -59,15 +91,12 @@ def _resolve_callback(
 ) -> Callable[..., Any]:
     if isinstance(spec, HandlerRef):
         spec = spec.name
-
     if isinstance(spec, str):
         resolved = getattr(plugin, spec, None)
         if callable(resolved):
             return resolved
         msg = f"Configured callback {spec!r} was not found on {type(plugin).__name__}"
-        raise ConfigurationError(
-            msg,
-        )
+        raise ConfigurationError(msg)
     if callable(spec):
         binder = getattr(spec, "__get__", None)
         if callable(binder) and getattr(spec, "__self__", None) is None:
@@ -78,9 +107,7 @@ def _resolve_callback(
         if callable(fallback):
             return fallback
     msg = f"Missing callback configuration on {type(plugin).__name__}"
-    raise ConfigurationError(
-        msg,
-    )
+    raise ConfigurationError(msg)
 
 
 class RuntimeView(discord.ui.LayoutView):
@@ -91,7 +118,7 @@ class RuntimeView(discord.ui.LayoutView):
 
 
 class GameManager:
-    """Executes final API plugins and owns all bot-authored match messages."""
+    """Owns a live game instance, Discord messages, and pending input requests."""
 
     def __init__(
         self,
@@ -105,6 +132,7 @@ class GameManager:
         match_id: int,
         match_public_code: str,
         match_options: dict[str, Any] | None = None,
+        thread: discord.Thread | None = None,
     ) -> None:
         self.game_type = game_type
         self.plugin_class = plugin_class
@@ -112,9 +140,8 @@ class GameManager:
             players=list(players),
             match_options=match_options or {},
         )
+        self.plugin._bind_runtime(self)
         self.game = self.plugin
-        # RNG / setup lines: plugins call ``log_replay_event``.
-        self.plugin._replay_hook = self._plugin_replay_hook
         self.creator = creator
         self.players = list(players)
         self.rated = rated
@@ -122,20 +149,35 @@ class GameManager:
         self.match_public_code = match_public_code
         self.match_options = dict(match_options or {})
         self.status_message = overview_message
-        self.thread: discord.Thread | None = None
+        self.thread = thread
         self.owned_messages: dict[str, discord.Message] = {}
         self.owned_message_purposes: dict[str, str] = {}
-        self._processing_move = asyncio.Lock()
+        self.player_roles: dict[int, Any] = {}
         self.ending_game = False
         self._interrupt_started = False
         self.forfeited_player_ids: set[int] = set()
         self.logger = log.getChild(game_type)
+        self._pending: PendingInputRequest | None = None
+        self._request_lock = asyncio.Lock()
+        self._main_task: asyncio.Task[Any] | None = None
+        self.rematch_view_factory: Any = None
 
     async def setup(self) -> None:
-        thread_name = f"{self.plugin.metadata.name} - {self.match_public_code}"
-        self.thread = await self.status_message.create_thread(name=thread_name)
+        if self.thread is None:
+            thread_name = f"{self.plugin.metadata.name} - {self.match_public_code}"
+            self.thread = await self.status_message.create_thread(name=thread_name)
         reg = get_container().registry
         guild = getattr(self.status_message, "guild", None)
+
+        roles_repo = get_container().roles_repository
+        self.player_roles = (
+            await run_in_thread(
+                roles_repo.get_role_assignments,
+                self.game_id,
+            )
+            or {}
+        )
+
         for player in self.players:
             player_id = getattr(player, "id", None)
             if player_id is not None:
@@ -153,7 +195,49 @@ class GameManager:
                     self.logger.debug("Failed to add player %s to thread", player_id)
         reg.games_by_thread_id[self.thread.id] = self
         await self._record_initial_replay_state_async()
-        await self.render_state()
+        await self._show_started_overview()
+        self._main_task = asyncio.create_task(self._run_main())
+
+    async def _show_started_overview(self) -> None:
+        text = f"Currently playing {self.plugin.metadata.name}"
+        try:
+            await self.status_message.edit(content=text, view=None, attachments=[])
+        except discord.errors.HTTPException as e:
+            if (
+                e.code == 50035
+            ):  # Invalid Form Body - likely IS_COMPONENTS_V2 flag issue
+                self.logger.debug(
+                    "Cannot update content on message with MessageFlags.IS_COMPONENTS_V2"
+                )
+            else:
+                self.logger.exception("Failed to update started overview")
+        except Exception:
+            self.logger.exception("Failed to update started overview")
+
+    async def _run_main(self) -> None:
+        try:
+            outcome = await self.plugin.main()
+        except AutoForfeit as exc:
+            outcome = self.plugin.outcome_for_forfeit(exc.players, reason="timeout")
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            from playcord.presentation.interactions.error import (
+                ErrorSurface,
+                report_runtime_error,
+            )
+
+            await report_runtime_error(
+                exc,
+                surface=ErrorSurface.RUNTIME,
+                interface=self,
+                logger=self.logger,
+                thread=self.thread,
+                status_message=self.status_message,
+            )
+            return
+        if outcome is not None:
+            await self.finish(outcome)
 
     def build_context(self) -> GameContext:
         owned = []
@@ -171,6 +255,12 @@ class GameManager:
                     metadata={},
                 ),
             )
+        roles: dict[int, str] = {}
+        for player_id, role_info in self.player_roles.items():
+            if isinstance(role_info, (tuple, list)) and role_info:
+                roles[int(player_id)] = str(role_info[0])
+            else:
+                roles[int(player_id)] = str(role_info)
         return GameContext(
             match_id=self.game_id,
             game_key=self.game_type,
@@ -178,65 +268,376 @@ class GameManager:
             match_options=dict(self.match_options),
             owned_messages=owned,
             latest_overview=getattr(self.status_message, "content", None),
+            roles=roles,
         )
 
-    async def render_state(self) -> None:
-        await self._apply_actions(self.plugin.render(self.build_context()))
+    async def update_message(
+        self,
+        message_id: str,
+        layout: MessageLayout,
+        *,
+        target: MessageTarget = "thread",
+        purpose: MessagePurpose = "board",
+    ) -> None:
+        await self._apply_actions(
+            (
+                UpsertMessage(
+                    target=target, key=message_id, layout=layout, purpose=purpose
+                ),
+            ),
+        )
 
-    async def display_game_state(self) -> None:
-        await self.render_state()
+    async def delete_message(
+        self,
+        message_id: str,
+        *,
+        target: MessageTarget = "thread",
+    ) -> None:
+        await self._apply_actions((DeleteMessage(target=target, key=message_id),))
 
-    async def await_pending_ui_tasks(self) -> None:
-        return None
+    async def request_input(
+        self,
+        *,
+        players: Sequence[Any],
+        inputs: Sequence[GameInputSpec],
+        timeout: float,
+        mode: InputMode = "first",
+        min_responses: int | None = None,
+        message_id: str | None = None,
+        layout: MessageLayout | None = None,
+        target: MessageTarget = "thread",
+        purpose: MessagePurpose = "board",
+        auto_remove_on_timeout: bool = False,
+        send_timeout_warning: bool = True,
+    ) -> GameInput | list[GameInput] | InputTimeout:
+        if not players:
+            msg = "request_input requires at least one player"
+            raise ValueError(msg)
+        if not inputs:
+            msg = "request_input requires at least one input"
+            raise ValueError(msg)
+        async with self._request_lock:
+            if self._pending is not None:
+                msg = "A game input request is already pending"
+                raise RuntimeError(msg)
+            loop = asyncio.get_running_loop()
+            request = PendingInputRequest(
+                request_id=uuid4().hex[:12],
+                players=tuple(players),
+                inputs=tuple(inputs),
+                mode=mode,
+                min_responses=(
+                    min_responses
+                    if min_responses is not None
+                    else (1 if mode == "first" else len(players))
+                ),
+                future=loop.create_future(),
+            )
+            self._pending = request
+            if layout is not None and message_id is not None:
+                request_layout = self._layout_with_request_inputs(
+                    layout, request.inputs
+                )
+                await self.update_message(
+                    message_id,
+                    request_layout,
+                    target=target,
+                    purpose=purpose,
+                )
+            self._schedule_bot_inputs(request)
+        try:
+            return await asyncio.wait_for(request.future, timeout=timeout)
+        except TimeoutError:
+            timeout_result = InputTimeout(
+                request_id=request.request_id,
+                players=tuple(request.players),
+                missing_players=request.missing_players(),
+                responses=dict(request.responses),
+            )
+            if send_timeout_warning or auto_remove_on_timeout:
+                await self._handle_input_timeout(
+                    timeout_result,
+                    auto_remove=auto_remove_on_timeout,
+                    send_warning=send_timeout_warning,
+                )
+            return timeout_result
+        finally:
+            async with self._request_lock:
+                if self._pending is request:
+                    self._pending = None
+                for task in request.bot_tasks:
+                    task.cancel()
 
-    async def move_by_command(
+    @staticmethod
+    def _layout_with_request_inputs(
+        layout: MessageLayout,
+        inputs: tuple[GameInputSpec, ...],
+    ) -> MessageLayout:
+        buttons = layout.buttons or tuple(
+            spec for spec in inputs if isinstance(spec, ButtonInput)
+        )
+        selects = layout.selects or tuple(
+            spec for spec in inputs if isinstance(spec, SelectInput)
+        )
+        return MessageLayout(
+            content=layout.content,
+            buttons=buttons,
+            selects=selects,
+            attachments=layout.attachments,
+            button_row_width=layout.button_row_width,
+        )
+
+    def _schedule_bot_inputs(self, request: PendingInputRequest) -> None:
+        for player in request.players:
+            if getattr(player, "is_bot", False):
+                request.bot_tasks.append(
+                    asyncio.create_task(self._submit_bot_input(player, request))
+                )
+
+    async def _submit_bot_input(
+        self, player: Any, request: PendingInputRequest
+    ) -> None:
+        await asyncio.sleep(0.5)
+        if self.ending_game:
+            return
+        difficulty = str(getattr(player, "bot_difficulty", None) or "easy")
+        definition = self.plugin.metadata.bots.get(difficulty)
+        if definition is None and self.plugin.metadata.bots:
+            definition = next(iter(self.plugin.metadata.bots.values()))
+        if definition is None:
+            return
+        callback = _resolve_callback(self.plugin, definition.callback, "bot_input")
+        decision = callback(player, request=request, ctx=self.build_context())
+        if inspect.isawaitable(decision):
+            decision = await decision
+        if not decision:
+            return
+        if isinstance(decision, str):
+            input_id = decision
+            arguments: dict[str, Any] = {}
+            values: tuple[str, ...] = ()
+        else:
+            input_id = str(decision.get("input_id", ""))
+            arguments = dict(decision.get("arguments", {}) or {})
+            values = tuple(str(value) for value in decision.get("values", ()) or ())
+        await self._accept_input(
+            actor=player,
+            request_id=request.request_id,
+            input_id=input_id,
+            source="bot",
+            arguments=arguments,
+            values=values,
+            interaction=None,
+        )
+
+    async def submit_component_input(
         self,
         ctx: discord.Interaction,
-        name: str,
-        arguments: dict[str, Any],
         *,
-        current_turn_required: bool = True,
+        payload: str,
+        source: InputSource,
     ) -> None:
-        await self._apply_move(
-            ctx,
-            name=name,
+        request_id, input_id, arguments = self.decode_input_payload(payload)
+        values: tuple[str, ...] = ()
+        if source == "select":
+            values = tuple(str(value) for value in (ctx.data or {}).get("values") or ())
+        actor = self._player_by_id(getattr(ctx.user, "id", None))
+        await self._accept_input(
+            actor=actor,
+            request_id=request_id,
+            input_id=input_id,
+            source=source,
             arguments=arguments,
+            values=values,
+            interaction=ctx,
+        )
+
+    async def submit_command_input(
+        self,
+        ctx: discord.Interaction,
+        *,
+        command_name: str,
+        arguments: dict[str, Any],
+    ) -> None:
+        async with self._request_lock:
+            pending = self._pending
+            command_input = None
+            if pending is not None:
+                command_input = next(
+                    (
+                        spec
+                        for spec in pending.command_inputs
+                        if spec.command_name == command_name
+                    ),
+                    None,
+                )
+            request_id = pending.request_id if pending is not None else ""
+            input_id = command_input.id if command_input is not None else ""
+        actor = self._player_by_id(getattr(ctx.user, "id", None))
+        accepted = await self._accept_input(
+            actor=actor,
+            request_id=request_id,
+            input_id=input_id,
             source="command",
-            current_turn_required=current_turn_required,
+            arguments=arguments,
+            values=(),
+            interaction=ctx,
+        )
+        if accepted:
+            await followup_send(
+                ctx,
+                "Input received.",
+                ephemeral=True,
+                delete_after=EPHEMERAL_DELETE_AFTER,
+            )
+
+    async def _accept_input(
+        self,
+        *,
+        actor: Any | None,
+        request_id: str,
+        input_id: str,
+        source: InputSource,
+        arguments: dict[str, Any],
+        values: tuple[str, ...],
+        interaction: discord.Interaction | None,
+    ) -> bool:
+        async with self._request_lock:
+            pending = self._pending
+            if pending is None or pending.request_id != request_id:
+                await self._send_invalid_input(
+                    interaction, "That input is not valid right now."
+                )
+                return False
+            if actor is None or int(actor.id) not in pending.player_ids:
+                await self._send_invalid_input(
+                    interaction, get("permissions.not_participant")
+                )
+                return False
+            spec = pending.input_by_id.get(input_id)
+            if spec is None or not self._source_matches_spec(source, spec):
+                await self._send_invalid_input(
+                    interaction, "That input is not valid right now."
+                )
+                return False
+            player_id = int(actor.id)
+            game_input = GameInput(
+                request_id=request_id,
+                input_id=input_id,
+                actor=actor,
+                source=source,
+                arguments=dict(arguments),
+                values=values,
+                ctx=self.build_context(),
+            )
+            pending.responses[player_id] = game_input
+            if pending.future.done():
+                return True
+            if pending.mode == "first":
+                pending.future.set_result(game_input)
+            elif len(pending.responses) >= pending.min_responses:
+                ordered = [
+                    pending.responses[int(player.id)]
+                    for player in pending.players
+                    if int(player.id) in pending.responses
+                ]
+                pending.future.set_result(ordered)
+        return True
+
+    @staticmethod
+    def _source_matches_spec(source: InputSource, spec: GameInputSpec) -> bool:
+        return (
+            (source == "button" and isinstance(spec, ButtonInput))
+            or (source == "select" and isinstance(spec, SelectInput))
+            or (source == "command" and isinstance(spec, CommandInput))
+            or source == "bot"
         )
 
-    async def move_by_button(
+    async def _send_invalid_input(
         self,
-        ctx: discord.Interaction,
+        interaction: discord.Interaction | None,
+        message: str,
+    ) -> None:
+        if interaction is None:
+            return
+        await followup_send(
+            interaction,
+            message,
+            ephemeral=True,
+            delete_after=EPHEMERAL_DELETE_AFTER,
+        )
+
+    async def record_move(
+        self,
+        actor: Any,
         name: str,
         arguments: dict[str, Any],
         *,
-        current_turn_required: bool = True,
+        source: InputSource,
+        input_id: str | None = None,
     ) -> None:
-        await self._apply_move(
-            ctx,
-            name=name,
-            arguments=arguments,
-            source="button",
-            current_turn_required=current_turn_required,
-        )
+        payload = dict(arguments)
+        if input_id is not None:
+            payload["input_id"] = input_id
+        await self._record_move(actor, name, payload, source=source)
 
-    async def move_by_select(
+    def log_replay_event(self, event_type: str, **payload: Any) -> None:
+        self._plugin_replay_hook(event_type, payload)
+
+    async def _handle_input_timeout(
         self,
-        ctx: discord.Interaction,
-        name: str,
+        timeout_result: InputTimeout,
         *,
-        current_turn_required: bool = True,
+        auto_remove: bool = False,
+        send_warning: bool = True,
     ) -> None:
-        values = list((ctx.data or {}).get("values") or [])
-        arguments = {"values": values}
-        await self._apply_move(
-            ctx,
-            name=name,
-            arguments=arguments,
-            source="select",
-            current_turn_required=current_turn_required,
+        """Handle input timeout by sending warnings and optionally removing players."""
+        import time
+
+        missing_players = timeout_result.missing_players
+        if not missing_players:
+            return
+
+        if send_warning and self.thread is not None:
+            current_time = int(time.time())
+            timestamp_str = f"<t:{current_time}:R>"
+            warning_msg = get(
+                "timeout.warning",
+                default="⏱️ Input timeout for {players} ({timestamp}).",
+            ).format(
+                players=", ".join(p.mention for p in missing_players),
+                timestamp=timestamp_str,
+            )
+            try:
+                await self.thread.send(warning_msg, delete_after=EPHEMERAL_DELETE_AFTER)
+            except Exception:
+                self.logger.exception("Failed to send timeout warning")
+
+        if auto_remove:
+            for player in missing_players:
+                if int(player.id) not in self.forfeited_player_ids:
+                    self.forfeited_player_ids.add(int(player.id))
+            if len(self.forfeited_player_ids) >= len(self.plugin.players):
+                outcome = self.plugin.outcome_for_forfeit(
+                    missing_players,
+                    reason="timeout",
+                )
+                await self.finish(outcome)
+
+    async def forfeit_player(
+        self, player_or_id: Any, *, reason: str = "forfeit"
+    ) -> Any:
+        player = (
+            self._player_by_id(player_or_id)
+            if not hasattr(player_or_id, "id")
+            else player_or_id
         )
+        if player is None:
+            return get("forfeit.not_in_game")
+        self.forfeited_player_ids.add(int(player.id))
+        outcome = self.plugin.outcome_for_forfeit([player], reason=reason)
+        await self.finish(outcome)
+        return f"{player.mention} forfeited."
 
     async def handle_spectate(self, ctx: discord.Interaction) -> None:
         if self.thread is not None:
@@ -249,119 +650,29 @@ class GameManager:
         if peek_callback:
             callback = _resolve_callback(self.plugin, peek_callback)
             value = callback(ctx=self.build_context())
+            if inspect.isawaitable(value):
+                value = await value
             if value is not None:
                 text = str(value).strip() or None
         if text is None:
             text = get("success.already_participant")
         await followup_send(ctx, text, ephemeral=True)
 
-    async def run_bot_turn_if_needed(self) -> None:
-        outcome = self.plugin.outcome()
-        if outcome is not None:
-            await self.finish(outcome)
-            return
-        current = self.plugin.current_turn()
-        if current is None or not getattr(current, "is_bot", False):
-            return
-        difficulty = str(getattr(current, "bot_difficulty", "") or "easy")
-        definition = self.plugin.metadata.bots.get(difficulty)
-        if definition is None:
-            msg = (
-                f"Bot difficulty {difficulty!r} is not configured for {self.game_type}"
-            )
-            raise ConfigurationError(
-                msg,
-            )
-        callback = _resolve_callback(
-            self.plugin,
-            getattr(definition, "callback", None),
-            "bot_move",
-        )
-        move = callback(current, ctx=self.build_context())
-        if not move:
-            return
-        guild = self.thread.guild if self.thread is not None else None
-        fake = type(
-            "BotInteraction",
-            (),
-            {"user": current, "guild": guild, "channel": self.thread},
-        )()
-        await self._apply_bot_move(
-            fake,
-            name=str(move["move_name"]),
-            arguments=dict(move.get("arguments", {})),
-        )
-
-    async def finish(self, outcome) -> None:
+    async def finish(self, outcome: Any) -> None:
         if self.ending_game:
             return
         self.ending_game = True
+        async with self._request_lock:
+            pending = self._pending
+            self._pending = None
+            if pending is not None and not pending.future.done():
+                pending.future.cancel()
+        task = self._main_task
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
         from playcord.application.services.match_lifecycle import finish_match
 
         await finish_match(self, outcome)
-
-    async def _apply_bot_move(
-        self,
-        ctx: Any,
-        *,
-        name: str,
-        arguments: dict[str, Any],
-    ) -> None:
-        async with self._processing_move:
-            actor = self._player_by_id(getattr(ctx.user, "id", None))
-            if actor is None:
-                return
-            callback = self._resolve_move_callback(name)
-            actions = self._invoke_move_handler(
-                callback,
-                actor=actor,
-                arguments=arguments,
-                source="bot",
-            )
-            await self._record_move(actor, name, arguments, source="bot")
-            await self._apply_actions(actions)
-            if outcome := self.plugin.outcome():
-                await self.finish(outcome)
-
-    async def _apply_move(
-        self,
-        ctx: discord.Interaction,
-        *,
-        name: str,
-        arguments: dict[str, Any],
-        source: str,
-        current_turn_required: bool,
-    ) -> None:
-        async with self._processing_move:
-            actor = self._player_by_id(getattr(ctx.user, "id", None))
-            if actor is None:
-                await followup_send(
-                    ctx,
-                    get("move.no_active_game_description"),
-                    ephemeral=True,
-                )
-                return
-            current = self.plugin.current_turn()
-            if current_turn_required and current is not None and current.id != actor.id:
-                await followup_send(
-                    ctx,
-                    get("permissions.not_your_turn"),
-                    ephemeral=True,
-                )
-                return
-            callback = self._resolve_move_callback(name)
-            actions = self._invoke_move_handler(
-                callback,
-                actor=actor,
-                arguments=arguments,
-                source=source,
-            )
-            await self._record_move(actor, name, arguments, source=source)
-            await self._apply_actions(actions)
-            if outcome := self.plugin.outcome():
-                await self.finish(outcome)
-                return
-        await self.run_bot_turn_if_needed()
 
     async def _record_move(
         self,
@@ -369,7 +680,7 @@ class GameManager:
         name: str,
         arguments: dict[str, Any],
         *,
-        source: str,
+        source: InputSource,
     ) -> None:
         def _sync_record() -> None:
             try:
@@ -406,8 +717,6 @@ class GameManager:
         await run_in_thread(_sync_record)
 
     def _plugin_replay_hook(self, event_type: str, payload: dict[str, Any]) -> None:
-        """Synchronous callback from plugins; schedule DB I/O to avoid blocking the event loop."""
-
         def _write() -> None:
             try:
                 body: dict[str, Any] = {"type": event_type, **dict(payload)}
@@ -462,70 +771,6 @@ class GameManager:
                 )
 
         await run_in_thread(_write)
-
-    def _resolve_move_callback(self, move_name: str) -> Callable[..., Any]:
-        move: Move | None = None
-        for candidate in self.plugin.metadata.moves:
-            if candidate.name == move_name:
-                move = candidate
-                break
-        if move is None:
-            msg = f"Move {move_name!r} is not defined for {self.plugin.metadata.key}"
-            raise ConfigurationError(
-                msg,
-            )
-        return _resolve_callback(self.plugin, move.callback, "apply_move")
-
-    @staticmethod
-    def _uses_typed_move_request(callback: Callable[..., Any]) -> bool:
-        try:
-            signature = inspect.signature(callback)
-        except (TypeError, ValueError):
-            return False
-
-        positional = [
-            parameter
-            for parameter in signature.parameters.values()
-            if parameter.kind
-            in (
-                inspect.Parameter.POSITIONAL_ONLY,
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            )
-        ]
-        required_keyword_only = [
-            parameter
-            for parameter in signature.parameters.values()
-            if parameter.kind is inspect.Parameter.KEYWORD_ONLY
-            and parameter.default is inspect.Parameter.empty
-        ]
-        return len(positional) == 1 and not required_keyword_only
-
-    def _invoke_move_handler(
-        self,
-        callback: Callable[..., Any],
-        *,
-        actor: Any,
-        arguments: dict[str, Any],
-        source: str,
-    ) -> tuple[Any, ...]:
-        context = self.build_context()
-        if self._uses_typed_move_request(callback):
-            actions = callback(
-                MoveRequest(
-                    actor=actor,
-                    arguments=dict(arguments),
-                    source=source,
-                    ctx=context,
-                ),
-            )
-        else:
-            actions = callback(
-                actor,
-                dict(arguments),
-                source=source,
-                ctx=context,
-            )
-        return tuple(actions or ())
 
     async def _apply_actions(self, actions: tuple[Any, ...]) -> None:
         for action in actions:
@@ -596,9 +841,8 @@ class GameManager:
         self,
         message: discord.Message | None,
         /,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
-        """Edit a message while handling Discord components-v2 content restrictions."""
         if message is None:
             return
         edit_kwargs = dict(kwargs)
@@ -611,7 +855,6 @@ class GameManager:
                     "Dropping content from edit because message uses components v2",
                 )
                 edit_kwargs.pop("content", None)
-
             await message.edit(**edit_kwargs)
         except Exception as exc:
             if (
@@ -621,9 +864,6 @@ class GameManager:
             ):
                 retry_kwargs = dict(edit_kwargs)
                 retry_kwargs.pop("content", None)
-                self.logger.debug(
-                    "Retrying edit without content due to components v2 validation",
-                )
                 try:
                     await message.edit(**retry_kwargs)
                     return
@@ -633,7 +873,6 @@ class GameManager:
                         getattr(message, "id", None),
                     )
                     return
-
             self.logger.exception(
                 "Failed to edit message %s",
                 getattr(message, "id", None),
@@ -654,16 +893,12 @@ class GameManager:
         flags = getattr(message, "flags", None)
         if flags is None:
             return False
-
         marker = getattr(flags, "is_components_v2", None)
         if marker is not None:
             return bool(marker)
-
         flag_const = getattr(discord.MessageFlags, "IS_COMPONENTS_V2", None)
-        if flag_const is None:
-            return False
         flags_val = getattr(flags, "value", None)
-        if flags_val is None:
+        if flag_const is None or flags_val is None:
             return False
         try:
             return (int(flags_val) & int(flag_const)) != 0
@@ -742,46 +977,37 @@ class GameManager:
         )
         return self._build_interactive_view(layout, trail)
 
-    def _make_button(self, spec: ButtonSpec) -> discord.ui.Button:
+    def _make_button(self, spec: ButtonInput) -> discord.ui.Button:
         style_map = {
             "primary": discord.ButtonStyle.primary,
             "secondary": discord.ButtonStyle.secondary,
             "success": discord.ButtonStyle.success,
             "danger": discord.ButtonStyle.danger,
         }
+        request_id = self._request_id_for_input(spec.id)
         payload = urlencode(
             {
-                "name": spec.action_name,
-                "current_turn": "1" if spec.require_current_turn else "0",
+                "request_id": request_id,
+                "input_id": spec.id,
                 **{f"arg_{key}": str(value) for key, value in spec.arguments.items()},
             },
         )
         resource_id = self.thread.id if self.thread is not None else self.game_id
         custom_id = f"{BUTTON_PREFIX_GAME_MOVE}{resource_id}/{payload}"
-        # Discord requires a non-empty label for components. Some plugins may
-        # provide only an emoji or an empty string. Use a zero-width space as
-        # a safe placeholder so the component is valid while visually
-        # appearing empty. Treat empty/whitespace-only labels as missing.
         label = spec.label if (spec.label and spec.label.strip()) else "\u200b"
         return discord.ui.Button(
             label=label,
             emoji=spec.emoji,
             style=style_map[spec.style],
             custom_id=custom_id,
-            disabled=spec.disabled,
+            disabled=spec.disabled or not request_id,
         )
 
-    def _make_select(self, spec: SelectSpec) -> discord.ui.Select:
-        payload = urlencode(
-            {
-                "name": spec.action_name,
-                "current_turn": "1" if spec.require_current_turn else "0",
-            },
-        )
+    def _make_select(self, spec: SelectInput) -> discord.ui.Select:
+        request_id = self._request_id_for_input(spec.id)
+        payload = urlencode({"request_id": request_id, "input_id": spec.id})
         resource_id = self.thread.id if self.thread is not None else self.game_id
         custom_id = f"{BUTTON_PREFIX_GAME_SELECT}{resource_id}/{payload}"
-        # Ensure each option has a non-empty label; fall back to the option
-        # value if label is empty to satisfy Discord's API requirements.
         options = []
         for option in spec.options:
             opt_label = (
@@ -796,32 +1022,45 @@ class GameManager:
                     default=option.default,
                 ),
             )
-
         return discord.ui.Select(
             custom_id=custom_id,
             placeholder=spec.placeholder,
             options=options,
-            disabled=spec.disabled,
+            min_values=spec.min_values,
+            max_values=spec.max_values,
+            disabled=spec.disabled or not request_id,
         )
 
-    def decode_component_payload(
-        self,
-        payload: str,
-    ) -> tuple[str, dict[str, Any], bool]:
+    def _request_id_for_input(self, input_id: str) -> str:
+        pending = self._pending
+        if pending is None:
+            return ""
+        if input_id not in pending.input_by_id:
+            return ""
+        return pending.request_id
+
+    def decode_input_payload(self, payload: str) -> tuple[str, str, dict[str, Any]]:
         parsed = parse_qs(payload)
-        name = parsed.get("name", [""])[0]
-        current_turn = parsed.get("current_turn", ["1"])[0] == "1"
+        request_id = parsed.get("request_id", [""])[0]
+        input_id = parsed.get("input_id", [""])[0]
         arguments = {
             key.removeprefix("arg_"): values[0]
             for key, values in parsed.items()
             if key.startswith("arg_")
         }
-        return name, arguments, current_turn
+        return request_id, input_id, arguments
 
     def _player_by_id(self, user_id: Any) -> Any | None:
+        try:
+            wanted = int(user_id)
+        except (TypeError, ValueError):
+            return None
         for player in self.players:
-            if getattr(player, "id", None) == user_id:
-                return player
+            try:
+                if int(getattr(player, "id", 0)) == wanted:
+                    return player
+            except (TypeError, ValueError):
+                continue
         return None
 
 

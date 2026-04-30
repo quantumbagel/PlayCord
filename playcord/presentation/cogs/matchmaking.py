@@ -7,6 +7,7 @@ from playcord.infrastructure.constants import (
     BUTTON_PREFIX_INVITE,
     BUTTON_PREFIX_JOIN,
     BUTTON_PREFIX_LEAVE,
+    BUTTON_PREFIX_LOBBY_ASSIGN_ROLES,
     BUTTON_PREFIX_LOBBY_OPT,
     BUTTON_PREFIX_LOBBY_ROLE,
     BUTTON_PREFIX_READY,
@@ -49,8 +50,10 @@ class MatchmakingCog(commands.Cog):
             await self.lobby_select_callback(ctx)
         elif custom_id.startswith(BUTTON_PREFIX_LOBBY_ROLE):
             await self.lobby_role_select_callback(ctx)
+        elif custom_id.startswith(BUTTON_PREFIX_LOBBY_ASSIGN_ROLES):
+            await self.lobby_assign_roles_callback(ctx)
         elif custom_id.startswith(
-            (BUTTON_PREFIX_JOIN, BUTTON_PREFIX_LEAVE, BUTTON_PREFIX_READY)
+            (BUTTON_PREFIX_JOIN, BUTTON_PREFIX_LEAVE, BUTTON_PREFIX_READY),
         ):
             await self.matchmaking_button_callback(ctx)
         elif custom_id.startswith(BUTTON_PREFIX_INVITE):
@@ -203,6 +206,76 @@ class MatchmakingCog(commands.Cog):
         )
         matchmaker = self._lobbies[matchmaking_id]
         await matchmaker.callback_role_select(ctx, player_id)
+
+    async def lobby_assign_roles_callback(self, ctx: discord.Interaction) -> None:
+        """Assign roles button for selectable_random flow."""
+        await ctx.response.defer(ephemeral=True)
+        f_log = log.getChild("callback.lobby_assign_roles")
+        f_log.debug(
+            "lobby_assign_roles_callback called by user=%s data=%r",
+            getattr(ctx.user, "id", None),
+            ctx.data,
+        )
+        data = ctx.data if ctx.data is not None else {}
+        cid = data.get("custom_id")
+        if not cid or not cid.startswith(BUTTON_PREFIX_LOBBY_ASSIGN_ROLES):
+            f_log.warning(
+                "Invalid lobby_assign_roles interaction from user=%s cid=%r",
+                getattr(ctx.user, "id", None),
+                cid,
+            )
+            await followup_send(
+                ctx,
+                content=get("matchmaking.invalid_interaction"),
+                ephemeral=True,
+                delete_after=EPHEMERAL_DELETE_AFTER,
+            )
+            return
+        rest = cid[len(BUTTON_PREFIX_LOBBY_ASSIGN_ROLES) :]
+        mid_str = rest.rstrip("/")
+        if not mid_str:
+            await followup_send(
+                ctx,
+                content=get("matchmaking.invalid_button"),
+                ephemeral=True,
+                delete_after=EPHEMERAL_DELETE_AFTER,
+            )
+            return
+        try:
+            matchmaking_id = int(mid_str)
+        except ValueError:
+            f_log.warning(
+                "Invalid id in lobby_assign_roles from user=%s mid=%r",
+                getattr(ctx.user, "id", None),
+                mid_str,
+            )
+            await followup_send(
+                ctx,
+                content=get("matchmaking.invalid_button"),
+                ephemeral=True,
+                delete_after=EPHEMERAL_DELETE_AFTER,
+            )
+            return
+        if matchmaking_id not in self._lobbies:
+            f_log.info(
+                "Lobby assign roles for expired matchmaking_id=%s by user=%s",
+                matchmaking_id,
+                getattr(ctx.user, "id", None),
+            )
+            await followup_send(
+                ctx,
+                content=get("matchmaking.session_expired"),
+                ephemeral=True,
+                delete_after=EPHEMERAL_DELETE_AFTER,
+            )
+            return
+        f_log.debug(
+            "lobby assign roles lobby=%s user=%s",
+            matchmaking_id,
+            ctx.user.id,
+        )
+        matchmaker = self._lobbies[matchmaking_id]
+        await matchmaker.callback_assign_roles(ctx)
 
     async def matchmaking_button_callback(self, ctx: discord.Interaction) -> None:
         """Handle matchmaking button (Join / Leave / Ready)."""

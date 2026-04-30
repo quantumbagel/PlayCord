@@ -118,7 +118,7 @@ def flush_events() -> int:
     flushed = 0
     try:
         try:
-            c.guilds.cleanup_old_analytics(days=get_settings().analytics_retention_days)
+            c.guilds_repository.cleanup_old_analytics(days=get_settings().analytics_retention_days)
         except Exception:
             logger.debug("Analytics cleanup skipped during flush", exc_info=True)
         repo = c.analytics_repository

@@ -31,7 +31,10 @@ class Player:
     @property
     def mention(self) -> str:
         if self.is_bot:
-            return self.display_name or "Bot"
+            base = self.display_name or "Bot"
+            if self.bot_difficulty:
+                return f"{base} ({self.bot_difficulty})"
+            return base
         return f"<@{self.id}>"
 
     @property

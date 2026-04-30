@@ -92,13 +92,12 @@ def _validate_handler(
 
 def validate_game_registration(game_class: type[RuntimeGame]) -> None:
     metadata = game_class.metadata
+    main = getattr(game_class, "main", None)
+    if not callable(main):
+        msg = f"{game_class.__name__} must define async main(self)"
+        raise ConfigurationError(msg)
+
     for move in metadata.moves:
-        _validate_handler(
-            game_class,
-            move.callback,
-            label=f"move:{move.name}",
-            default_attr="apply_move",
-        )
         for option in move.options:
             if option.autocomplete is None:
                 continue

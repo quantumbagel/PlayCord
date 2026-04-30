@@ -36,13 +36,13 @@ class LobbyRoster:
 
 
 def lobby_base_start_conditions_met(
-    *,
-    bots: list[Any],
-    game: Any,
-    metadata: Any,
-    queued_players: Any,
-    role_selections: dict[int, str],
-    specs: tuple[Any, ...],
+        *,
+        bots: list[Any],
+        game: Any,
+        metadata: Any,
+        queued_players: Any,
+        role_selections: dict[int, str],
+        specs: tuple[Any, ...],
 ) -> bool:
     total_players = len(queued_players) + len(bots)
     player_count = resolve_player_count(game)
@@ -69,39 +69,50 @@ def lobby_base_start_conditions_met(
 
 
 def lobby_add_bot(
-    roster: LobbyRoster,
-    difficulty: str,
-    *,
-    game: Any,
-    metadata: Any,
-    human_queue_size: int,
+        roster: LobbyRoster,
+        difficulty: str,
+        *,
+        game: Any,
+        metadata: Any,
+        human_queue_size: int,
+        number: int = 1,
 ) -> str | None:
     available_bots = getattr(metadata, "bots", {})
     if not available_bots:
         return get("queue.bot_not_supported")
     if difficulty not in available_bots:
         return fmt("queue.bot_invalid_difficulty", difficulty=difficulty)
-    if any(bot.bot_difficulty == difficulty for bot in roster.bots):
-        return fmt("queue.bot_already_added", difficulty=difficulty)
 
-    current_count = human_queue_size + len(roster.bots)
-    player_count = resolve_player_count(game)
-    if isinstance(player_count, list) and (current_count + 1) not in player_count:
-        return get("queue.bot_too_many_for_game")
-    if isinstance(player_count, int) and (current_count + 1) != player_count:
-        return get("queue.bot_too_many_for_game")
-
-    used_names = {
-        getattr(p, "name", None) for p in roster.bots if getattr(p, "name", None)
+    used_names: set[str] = {
+        name for name in (getattr(p, "name", None) for p in roster.bots)
+        if name is not None
     }
-    bot_name = generate_bot_name(used_names)
-    bot_player = Player.create_bot(
-        name=bot_name,
-        difficulty=difficulty,
-        bot_index=len(roster.bots),
-    )
-    roster.bots.append(bot_player)
+
+    for _ in range(number):
+        bot_name = generate_bot_name(used_names)
+        used_names.add(bot_name)
+        bot_player = Player.create_bot(
+            name=bot_name,
+            difficulty=difficulty,
+            bot_index=len(roster.bots),
+        )
+        roster.bots.append(bot_player)
+
     return None
+
+
+def lobby_remove_bot(roster: LobbyRoster, bot_name: str) -> str | None:
+    """Remove a bot from the roster by name.
+    
+    Returns an error message if the bot is not found, or None on success.
+    """
+    for i, bot in enumerate(roster.bots):
+        bot_display = getattr(bot, "display_name", None)
+        bot_name_attr = getattr(bot, "name", None)
+        if bot_display == bot_name or bot_name_attr == bot_name:
+            roster.bots.pop(i)
+            return None
+    return fmt("queue.bot_not_found", name=bot_name)
 
 
 @dataclass(slots=True)
@@ -111,11 +122,11 @@ class KickPhaseResult:
 
 
 def lobby_kick_phase(
-    *,
-    user_id: int,
-    remove_queued_player: Callable[[int], Any | None],
-    rotate_creator_if_needed: Callable[[int], None],
-    queued_count: Callable[[], int],
+        *,
+        user_id: int,
+        remove_queued_player: Callable[[int], Any | None],
+        rotate_creator_if_needed: Callable[[int], None],
+        queued_count: Callable[[], int],
 ) -> KickPhaseResult:
     kicked = remove_queued_player(user_id) is not None
     if queued_count() == 0:
@@ -132,15 +143,15 @@ class BanPhaseResult:
 
 
 def lobby_ban_phase(
-    roster: LobbyRoster,
-    *,
-    private: bool,
-    new_player: Any,
-    target_user_id: int,
-    remove_queued_player: Callable[[int], Any | None],
-    rotate_creator_if_needed: Callable[[int], None],
-    queued_count: Callable[[], int],
-    discard_from_whitelist: Callable[[int], Any | None],
+        roster: LobbyRoster,
+        *,
+        private: bool,
+        new_player: Any,
+        target_user_id: int,
+        remove_queued_player: Callable[[int], Any | None],
+        rotate_creator_if_needed: Callable[[int], None],
+        queued_count: Callable[[], int],
+        discard_from_whitelist: Callable[[int], Any | None],
 ) -> BanPhaseResult:
     kicked = remove_queued_player(new_player.id) is not None
     if queued_count() == 0:

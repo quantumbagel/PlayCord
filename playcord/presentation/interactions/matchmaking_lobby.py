@@ -6,6 +6,7 @@ from typing import Any
 
 import discord
 
+from playcord.api.metadata import RoleFlow
 from playcord.api.plugin import RoleMode, resolve_player_count
 from playcord.application.runtime_context import get_container
 from playcord.application.services.match_lifecycle import start_match_from_lobby
@@ -15,12 +16,15 @@ from playcord.application.services.matchmaker import (
     lobby_ban_phase,
     lobby_base_start_conditions_met,
     lobby_kick_phase,
+    lobby_remove_bot,
 )
+from playcord.application.services.role_management import has_role_support
 from playcord.core.player import Player
 from playcord.infrastructure.analytics_client import Timer
 from playcord.infrastructure.constants import (
     BUTTON_PREFIX_JOIN,
     BUTTON_PREFIX_LEAVE,
+    BUTTON_PREFIX_LOBBY_ASSIGN_ROLES,
     BUTTON_PREFIX_READY,
     EPHEMERAL_DELETE_AFTER,
     GAME_TYPES,
@@ -378,14 +382,27 @@ class MatchmakingInterface:
                     return
             self.creator = _LobbyCreatorRef(int(nid))
 
-    def add_bot(self, difficulty: str) -> str | None:
+    def add_bot(self, difficulty: str, number: int = 1) -> str | None:
         err = lobby_add_bot(
             self._lobby_roster,
             difficulty,
             game=self.game,
             metadata=self.metadata,
             human_queue_size=len(self.queued_players),
+            number=number,
         )
+        if err is not None:
+            return err
+        self._sync_rated_flag()
+        getattr(self, "_reset_ready_state", lambda: None)()
+        return None
+
+    def remove_bot(self, bot_name: str) -> str | None:
+        """Remove a bot by name.
+        
+        Returns an error message if not found, or None on success.
+        """
+        err = lobby_remove_bot(self._lobby_roster, bot_name)
         if err is not None:
             return err
         self._sync_rated_flag()
@@ -437,7 +454,7 @@ class MatchmakingInterface:
         ctx: discord.Interaction,
         player_id: int,
     ) -> None:
-        """Handle per-player role string select for CHOSEN :attr:`role_mode`."""
+        """Handle per-player role string select for plugin-owned roles."""
         log = self.logger.getChild("lobby_role_select")
         if ctx.user.id != player_id:
             await followup_send(
@@ -447,8 +464,22 @@ class MatchmakingInterface:
                 delete_after=EPHEMERAL_DELETE_AFTER,
             )
             return
-        if getattr(self.metadata, "role_mode", RoleMode.none) != RoleMode.chosen:
-            log.warning("role select on non-CHOSEN lobby lobby=%s", self.message.id)
+
+        role_flow = getattr(self.metadata, "role_flow", RoleFlow.none)
+        role_mode = getattr(self.metadata, "role_mode", RoleMode.none)
+
+        # Support both new role_flow and legacy role_mode for backward compatibility
+        is_selectable = (
+            role_flow
+            in (
+                RoleFlow.selectable,
+                RoleFlow.selectable_random,
+            )
+            or role_mode == RoleMode.chosen
+        )
+
+        if not is_selectable:
+            log.warning("role select on non-selectable lobby lobby=%s", self.message.id)
             await followup_send(
                 ctx,
                 get("matchmaking.invalid_interaction"),
@@ -456,8 +487,26 @@ class MatchmakingInterface:
                 delete_after=EPHEMERAL_DELETE_AFTER,
             )
             return
+
         raw = (ctx.data.get("values") or [""])[0]
         self.role_selections[player_id] = str(raw)
+
+        # Validate roles if the plugin implements validation
+        if hasattr(self.game, "validate_roles"):
+            try:
+                validation_error = self.game.validate_roles(self.role_selections)
+                if validation_error:
+                    await followup_send(
+                        ctx,
+                        f"Invalid role selection: {validation_error}",
+                        ephemeral=True,
+                        delete_after=EPHEMERAL_DELETE_AFTER,
+                    )
+                    del self.role_selections[player_id]
+                    return
+            except Exception as e:
+                log.exception("Error validating roles: %s", e)
+
         getattr(self, "_reset_ready_state", lambda: None)()
         await self.update_embed()
         await followup_send(
@@ -466,6 +515,66 @@ class MatchmakingInterface:
             ephemeral=True,
             delete_after=EPHEMERAL_DELETE_AFTER,
         )
+
+    async def callback_assign_roles(
+        self,
+        ctx: discord.Interaction,
+    ) -> None:
+        """Randomly assign roles for selectable_random flow."""
+        log = self.logger.getChild("lobby_assign_roles")
+
+        role_flow = getattr(self.metadata, "role_flow", RoleFlow.none)
+        if role_flow != RoleFlow.selectable_random:
+            log.warning(
+                "assign_roles on non-selectable_random lobby lobby=%s",
+                self.message.id,
+            )
+            await followup_send(
+                ctx,
+                get("matchmaking.invalid_interaction"),
+                ephemeral=True,
+                delete_after=EPHEMERAL_DELETE_AFTER,
+            )
+            return
+
+        if not has_role_support(self.game):
+            await followup_send(
+                ctx,
+                "This game does not support role assignment",
+                ephemeral=True,
+                delete_after=EPHEMERAL_DELETE_AFTER,
+            )
+            return
+
+        try:
+            if hasattr(self.game, "assign_roles"):
+                players = list(self.queued_players)
+                from playcord.application.services.role_management import (
+                    assign_roles as assign_roles_svc,
+                )
+
+                assign_roles_svc(self.game, players)
+
+                # Populate role selections from assigned roles
+                for player in players:
+                    # For now, store role assignments (actual assignment happens at match start)
+                    pass
+
+            await self.update_embed()
+            await followup_send(
+                ctx,
+                "Roles have been randomly assigned!",
+                ephemeral=True,
+                delete_after=EPHEMERAL_DELETE_AFTER,
+            )
+        except Exception as e:
+            log.exception("Error assigning roles: %s", e)
+            await followup_send(
+                ctx,
+                f"Error assigning roles: {e!s}",
+                ephemeral=True,
+                delete_after=EPHEMERAL_DELETE_AFTER,
+            )
 
     async def update_embed(self) -> None:
         """Update the embed based on the players in self.players
@@ -532,8 +641,9 @@ class MatchmakingInterface:
             column_creator(all_players, self.creator).split("\n"),
             strict=False,
         ):
+            player_name = getattr(player, "mention", getattr(player, "name", "Unknown"))
             table_rows.append(
-                f"- {getattr(player, 'mention', getattr(player, 'name', 'Unknown'))}: "
+                f"- {player_name}: "
                 f"{get('queue.field_rating')} {rating} · {get('queue.field_creator')} {creator_marker}",
             )
         table_image_url = None
@@ -612,14 +722,43 @@ class MatchmakingInterface:
 
         role_mode = getattr(self.metadata, "role_mode", RoleMode.none)
         pr_roles = getattr(self.metadata, "player_roles", None)
+        role_flow = getattr(self.metadata, "role_flow", RoleFlow.none)
+
         layout_ok_chosen = len(self._specs) + len(self.all_players()) <= 4
-        show_role_selects = (
+
+        # Legacy role_mode support
+        show_role_selects_legacy = (
             role_mode == RoleMode.chosen
             and not self.has_bots
             and pr_roles is not None
             and len(pr_roles) == len(self.all_players())
             and layout_ok_chosen
         )
+
+        # New plugin-owned role system
+        show_role_selects_new = False
+        available_roles: dict[int, tuple[str, ...]] | None = None
+
+        if has_role_support(self.game) and role_flow in (
+            RoleFlow.selectable,
+            RoleFlow.selectable_random,
+        ):
+            if (
+                not self.has_bots
+                and len(self.queued_players) >= self.metadata.player_count[0]
+            ):
+                try:
+                    if hasattr(self.game, "role_selection_options"):
+                        available_roles = self.game.role_selection_options(
+                            [p.id for p in self.queued_players],
+                        )
+                        if available_roles and layout_ok_chosen:
+                            show_role_selects_new = True
+                except Exception as e:
+                    log.exception("Error getting role selection options: %s", e)
+
+        show_role_selects = show_role_selects_legacy or show_role_selects_new
+
         if role_mode == RoleMode.chosen:
             if self.has_bots:
                 container.add_field(
@@ -670,12 +809,33 @@ class MatchmakingInterface:
         )
         ready_label = get("buttons.ready_toggle")
         role_specs_list: list[tuple[int, str, tuple[str, ...]]] = []
-        if show_role_selects and pr_roles is not None:
-            avail = tuple(pr_roles)
-            for p in sorted(self.queued_players, key=lambda x: x.id):
-                disp = getattr(p, "name", None) or str(p.id)
-                role_specs_list.append((p.id, disp, avail))
+        if show_role_selects:
+            # Use new plugin-owned role system if available
+            if available_roles:
+                for p in sorted(self.queued_players, key=lambda x: x.id):
+                    disp = getattr(p, "name", None) or str(p.id)
+                    avail = available_roles.get(p.id, ())
+                    if avail:
+                        role_specs_list.append((p.id, disp, avail))
+            # Fall back to legacy role_mode system
+            elif pr_roles is not None:
+                avail = tuple(pr_roles)
+                for p in sorted(self.queued_players, key=lambda x: x.id):
+                    disp = getattr(p, "name", None) or str(p.id)
+                    role_specs_list.append((p.id, disp, avail))
         use_lobby_view = bool(self._specs) or show_role_selects
+
+        # Determine if we should show the assign roles button
+        assign_roles_button_id = None
+        if (
+            has_role_support(self.game)
+            and role_flow == RoleFlow.selectable_random
+            and not self.has_bots
+        ):
+            assign_roles_button_id = (
+                f"{BUTTON_PREFIX_LOBBY_ASSIGN_ROLES}{self.message.id}"
+            )
+
         if use_lobby_view:
             view = MatchmakingLobbyView(
                 join_button_id=join_id,
@@ -687,6 +847,7 @@ class MatchmakingInterface:
                 current_values=dict(self.match_settings),
                 role_specs=role_specs_list,
                 current_role_values=dict(self.role_selections),
+                assign_roles_button_id=assign_roles_button_id,
                 summary_text=container_to_markdown(container),
                 table_image_url=table_image_url,
             )

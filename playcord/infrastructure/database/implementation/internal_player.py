@@ -78,9 +78,21 @@ class InternalPlayer:
     @property
     def display_name(self) -> str:
         """Human-readable player name for table rendering."""
+        if self.is_bot:
+            base = self.name or "Bot"
+            if self.bot_difficulty:
+                return f"{base} ({self.bot_difficulty})"
+            return base
         if self.name:
             return f"@{str(self.name).lstrip('@')}"
         return f"@{self.id}"
+
+    @property
+    def mention(self) -> str:
+        """Discord mention format or bot display name."""
+        if self.is_bot:
+            return self.name or "Bot"
+        return f"<@{self.id}>"
 
     def get_formatted_elo(
         self,

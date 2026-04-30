@@ -45,7 +45,6 @@ def _build_move_callback(plugin_key: str, move: Any):
             ctx=interaction,
             name=move.name,
             arguments=arguments,
-            current_turn_required=move.require_current_turn,
         )
 
     parameters = [

@@ -10,6 +10,11 @@ from playcord.application.services.rating import (
     rated_results_for_placements,
     unrated_results_for_placements,
 )
+from playcord.application.services.role_management import (
+    assign_roles,
+    reorder_players_by_roles,
+    role_assignments_to_db_tuples,
+)
 from playcord.infrastructure.db_thread import run_in_thread
 from playcord.infrastructure.locale import get
 from playcord.infrastructure.logging import get_logger
@@ -43,6 +48,19 @@ async def start_match_from_lobby(
 
     match_options = dict(getattr(interface, "match_settings", {}) or {})
     matches = get_container().matches_repository
+
+    game_instance = plugin_class(players)
+    role_selections = getattr(interface, "role_selections", {})
+    role_assignments = assign_roles(game_instance, role_selections)
+
+    if role_assignments:
+        players = reorder_players_by_roles(players, role_assignments)
+
+    match_code = await run_in_thread(matches.ensure_unique_match_code)
+    thread = await message.create_thread(
+        name=f"{game_instance.metadata.name} - {match_code}",
+    )
+
     match_id, match_code = await run_in_thread(
         matches.create_game,
         interface.game_type,
@@ -50,9 +68,25 @@ async def start_match_from_lobby(
         [player.id for player in players],
         bool(interface.rated and not has_bots),
         message.channel.id,
-        None,
+        thread.id,
         {"match_options": match_options},
+        match_id=thread.id,
+        preset_match_code=match_code,
     )
+
+    if role_assignments:
+        db_tuples = role_assignments_to_db_tuples(role_assignments)
+        await run_in_thread(
+            get_container().roles_repository.save_role_assignments,
+            match_id,
+            db_tuples,
+        )
+        log.debug(
+            "Saved %d role assignments for match %s",
+            len(role_assignments),
+            match_id,
+        )
+
     runtime = GameManager(
         game_type=interface.game_type,
         plugin_class=plugin_class,
@@ -63,15 +97,10 @@ async def start_match_from_lobby(
         match_id=match_id,
         match_public_code=match_code,
         match_options=match_options,
+        thread=thread,
     )
     runtime.rematch_view_factory = rematch_view_factory
     await runtime.setup()
-    await run_in_thread(
-        matches.update_match_context,
-        match_id,
-        channel_id=message.channel.id,
-        thread_id=runtime.thread.id if runtime.thread is not None else None,
-    )
     return runtime
 
 

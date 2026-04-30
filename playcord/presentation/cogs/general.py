@@ -201,7 +201,7 @@ def _profile_supports_compact_avatar() -> bool:
 
 
 def resolve_match_for_replay(raw: str, guild_id: int, *, matches: Any) -> Any:
-    """Resolve a match from an 8-char public code or a numeric ``match_id`` (guild-scoped)."""
+    """Resolve a match from an 8-char public code or numeric id (Discord thread snowflake)."""
     from playcord.core.generators import is_match_code_token
 
     s = (raw or "").strip().lower()
@@ -1719,6 +1719,228 @@ class GeneralCog(commands.Cog):
             result,
             ephemeral=True,
             delete_after=EPHEMERAL_DELETE_AFTER,
+        )
+
+    bot_group = app_commands.Group(
+        name="bot",
+        description=get("commands.bot.description"),
+        parent=command_root,
+    )
+
+    @bot_group.command(name="list", description=get("commands.bot.list.description"))
+    @app_commands.check(interaction_check)
+    async def command_bot_list(self, ctx: discord.Interaction) -> None:
+        f_log = log.getChild("command.bot.list")
+        f_log.debug(f"/bot list called: {contextify(ctx)}")
+
+        mm_by_user = matchmaking_by_user_id()
+        if ctx.user.id not in mm_by_user:
+            await response_send_message(
+                ctx,
+                get("commands.bot.not_in_lobby"),
+                ephemeral=True,
+            )
+            return
+
+        matchmaker: MatchmakingInterface = mm_by_user[ctx.user.id]
+
+        # Check if game supports bots
+        available_bots = getattr(matchmaker.metadata, "bots", {})
+        if not available_bots:
+            await response_send_message(
+                ctx,
+                get("queue.bot_not_supported"),
+                ephemeral=True,
+            )
+            return
+
+        # Build the list display
+        lines = []
+        lines.append(f"**{get('commands.bot.available_difficulties')}:**")
+        for difficulty in sorted(available_bots.keys()):
+            lines.append(f"  • `{difficulty}`")
+
+        if matchmaker.bots:
+            lines.append("")
+            lines.append(f"**{get('commands.bot.queued_bots')}:**")
+            for bot in matchmaker.bots:
+                lines.append(f"  • {bot.display_name} ({bot.bot_difficulty})")
+        else:
+            lines.append("")
+            lines.append(f"*{get('commands.bot.no_queued_bots')}*")
+
+        await response_send_message(
+            ctx,
+            "\n".join(lines),
+            ephemeral=True,
+        )
+
+    async def _autocomplete_bot_difficulty(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[Choice[str]]:
+        mm_by_user = matchmaking_by_user_id()
+        if interaction.user.id not in mm_by_user:
+            return []
+
+        matchmaker: MatchmakingInterface = mm_by_user[interaction.user.id]
+        available_bots = getattr(matchmaker.metadata, "bots", {})
+
+        choices = []
+        for difficulty in sorted(available_bots.keys()):
+            if current.lower() in difficulty.lower():
+                choices.append(Choice(name=difficulty, value=difficulty))
+        return choices[:25]
+
+    async def _autocomplete_bot_name(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[Choice[str]]:
+        mm_by_user = matchmaking_by_user_id()
+        if interaction.user.id not in mm_by_user:
+            return []
+
+        matchmaker: MatchmakingInterface = mm_by_user[interaction.user.id]
+
+        choices = []
+        for bot in matchmaker.bots:
+            bot_name = bot.display_name or "Bot"
+            if current.lower() in bot_name.lower():
+                choices.append(Choice(name=bot_name, value=bot_name))
+        return choices[:25]
+
+    @bot_group.command(
+        name="add",
+        description=get("commands.bot.add.description"),
+    )
+    @app_commands.check(interaction_check)
+    @app_commands.autocomplete(difficulty=_autocomplete_bot_difficulty)
+    @app_commands.describe(
+        difficulty=get("commands.bot.add.param_difficulty"),
+        number=get("commands.bot.add.param_number"),
+    )
+    async def command_bot_add(
+        self,
+        ctx: discord.Interaction,
+        difficulty: str,
+        number: int = 1,
+    ) -> None:
+        f_log = log.getChild("command.bot.add")
+        f_log.debug(
+            f"/bot add called: difficulty={difficulty}, number={number} {contextify(ctx)}",
+        )
+
+        mm_by_user = matchmaking_by_user_id()
+        if ctx.user.id not in mm_by_user:
+            await response_send_message(
+                ctx,
+                get("commands.bot.not_in_lobby"),
+                ephemeral=True,
+            )
+            return
+
+        matchmaker: MatchmakingInterface = mm_by_user[ctx.user.id]
+
+        # Only lobby creator can add bots
+        if matchmaker.creator.id != ctx.user.id:
+            await response_send_message(
+                ctx,
+                get("commands.bot.only_creator"),
+                ephemeral=True,
+            )
+            return
+
+        # Validate number parameter
+        if number < 1:
+            await response_send_message(
+                ctx,
+                get("commands.bot.add.error_invalid_number"),
+                ephemeral=True,
+            )
+            return
+
+        # Add the bots
+        error = matchmaker.add_bot(difficulty, number=number)
+        if error:
+            await response_send_message(
+                ctx,
+                error,
+                ephemeral=True,
+            )
+            return
+
+        # Update the lobby display
+        await matchmaker.update_embed()
+        if number == 1:
+            await response_send_message(
+                ctx,
+                fmt("commands.bot.added", difficulty=difficulty),
+                ephemeral=True,
+            )
+        else:
+            await response_send_message(
+                ctx,
+                fmt("commands.bot.added_multiple", difficulty=difficulty, count=number),
+                ephemeral=True,
+            )
+
+    @bot_group.command(
+        name="remove",
+        description=get("commands.bot.remove.description"),
+    )
+    @app_commands.check(interaction_check)
+    @app_commands.autocomplete(name=_autocomplete_bot_name)
+    @app_commands.describe(
+        name=get("commands.bot.remove.param_name"),
+    )
+    async def command_bot_remove(
+        self,
+        ctx: discord.Interaction,
+        name: str,
+    ) -> None:
+        f_log = log.getChild("command.bot.remove")
+        f_log.debug(
+            f"/bot remove called: name={name} {contextify(ctx)}",
+        )
+
+        mm_by_user = matchmaking_by_user_id()
+        if ctx.user.id not in mm_by_user:
+            await response_send_message(
+                ctx,
+                get("commands.bot.not_in_lobby"),
+                ephemeral=True,
+            )
+            return
+
+        matchmaker: MatchmakingInterface = mm_by_user[ctx.user.id]
+
+        # Only lobby creator can remove bots
+        if matchmaker.creator.id != ctx.user.id:
+            await response_send_message(
+                ctx,
+                get("commands.bot.only_creator"),
+                ephemeral=True,
+            )
+            return
+
+        # Remove the bot
+        error = matchmaker.remove_bot(name)
+        if error:
+            await response_send_message(
+                ctx,
+                error,
+                ephemeral=True,
+            )
+            return
+
+        # Update the lobby display
+        await matchmaker.update_embed()
+        await response_send_message(
+            ctx,
+            fmt("commands.bot.removed", name=name),
+            ephemeral=True,
         )
 
     @command_root.command(
